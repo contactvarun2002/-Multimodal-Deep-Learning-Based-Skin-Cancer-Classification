@@ -1,0 +1,327 @@
+# ================================================================
+# DERM7PT STEP 8 — EXPLAINABILITY OF TRAINED HH-DYNAMICS CLASSIFIER
+# Actual Integrated Gradients (IG) on 768-D learned-fusion inputs
+# Exact 3-group interventional Shapley values (SHAP-style) over
+# Dermoscopic / Clinical / Metadata 256-D fusion segments.
+# NO Grad-CAM claimed: standalone frozen image encoders are NOT
+# connected end-to-end to this HH classifier in Steps 4–6.
+# ================================================================
+# Colab dependencies: %pip -q install torch pandas numpy matplotlib scikit-learn joblib
+
+import os, json, copy, itertools, random, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+import joblib
+
+SEED = 42
+MAX_TEST_EXPLANATIONS = 24  # increase for more samples
+IG_STEPS = 32               # increase to 64/128 for convergence checks
+BATCH_SIZE = 16
+CLASSES = ('Nevus', 'Melanoma', 'MISC', 'SK', 'BCC')
+GROUPS = {'Dermoscopic': slice(0, 256),
+          'Clinical': slice(256, 512),
+          'Metadata': slice(512, 768)}
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Device:', DEVICE)
+
+def get_base():
+    for prefix in ('/content/drive', '/content/gdrive'):
+        root = Path(prefix) / 'MyDrive' / 'Derm7pt'
+        if root.is_dir(): return root
+    from google.colab import drive
+    for prefix in ('/content/drive', '/content/gdrive'):
+        mount = Path(prefix)
+        mount.mkdir(parents=True, exist_ok=True)
+        if not os.path.ismount(str(mount)) and not any(mount.iterdir()):
+            drive.mount(str(mount), force_remount=False)
+        root = mount / 'MyDrive' / 'Derm7pt'
+        if root.is_dir(): return root
+    raise FileNotFoundError('MyDrive/Derm7pt not found. Mount Google Drive first.')
+
+BASE = get_base()
+PREP = BASE / 'Derm7pt_Preprocessed'
+STEP5 = PREP / 'Step5_Full_768D_Learned_Fusion'
+STEP6 = PREP / 'Step6_Full_FiveClass_HHSNN'
+OUT = PREP / 'Step8_HHSNN_Explainability'
+REPORT = OUT / 'Reports'; VIS = OUT / 'Visualizations'
+for p in (REPORT, VIS): p.mkdir(parents=True, exist_ok=True)
+
+# ------ Reproduce the Step 6 inference architecture exactly -----
+class HHMembrane(nn.Module):
+    def __init__(self, steps=20, dt=0.05):
+        super().__init__()
+        self.steps, self.dt = int(steps), float(dt)
+        self.g_na, self.g_k, self.g_l = 120.0, 36.0, 0.3
+        self.e_na, self.e_k, self.e_l = 50.0, -77.0, -54.387
+
+    @staticmethod
+    def vtrap(x, scale):
+        z = (x / scale).clamp(-30, 30)
+        denominator = torch.where(torch.abs(z) < 1e-4,
+                                  torch.ones_like(z), -torch.expm1(-z))
+        return torch.where(torch.abs(z) < 1e-4,
+                           scale * (1 + z/2 + z*z/12), x / denominator)
+
+    def forward(self, current):
+        v = torch.full_like(current, -65.0)
+        m = torch.full_like(current, 0.0529)
+        h = torch.full_like(current, 0.5961)
+        n = torch.full_like(current, 0.3177)
+        voltage_integral = torch.zeros_like(current)
+        spike_proxy = torch.zeros_like(current)
+        for _ in range(self.steps):
+            am = 0.1 * self.vtrap(v + 40.0, 10.0)
+            bm = 4.0 * torch.exp((-(v + 65.0) / 18.0).clamp(-30, 30))
+            ah = 0.07 * torch.exp((-(v + 65.0) / 20.0).clamp(-30, 30))
+            bh = torch.sigmoid((v + 35.0) / 10.0)
+            an = 0.01 * self.vtrap(v + 55.0, 10.0)
+            bn = 0.125 * torch.exp((-(v + 65.0) / 80.0).clamp(-30, 30))
+            m = torch.clamp(m + self.dt * (am * (1 - m) - bm * m), 0, 1)
+            h = torch.clamp(h + self.dt * (ah * (1 - h) - bh * h), 0, 1)
+            n = torch.clamp(n + self.dt * (an * (1 - n) - bn * n), 0, 1)
+            ion_na = self.g_na * (m ** 3) * h * (v - self.e_na)
+            ion_k = self.g_k * (n ** 4) * (v - self.e_k)
+            ion_l = self.g_l * (v - self.e_l)
+            v = torch.clamp(v + self.dt * (current - ion_na - ion_k - ion_l), -100, 80)
+            voltage_integral = voltage_integral + (v + 65.0) / 100.0
+            spike_proxy = spike_proxy + torch.sigmoid((v + 20.0) / 5.0)
+        return torch.cat([voltage_integral / self.steps,
+                          spike_proxy / self.steps], dim=1)
+
+class HHDynamicsClassifier(nn.Module):
+    def __init__(self, in_dim=768, neurons=256, n_classes=5, steps=20, dt=0.05,
+                 dropout=0.2):
+        super().__init__()
+        self.input_projection = nn.Linear(in_dim, neurons)
+        self.membrane = HHMembrane(steps=steps, dt=dt)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(neurons * 2),
+            nn.Linear(neurons * 2, 128), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(128, n_classes))
+
+    def forward(self, x):
+        current = 12.0 + 18.0 * torch.tanh(self.input_projection(x))
+        return self.classifier(self.membrane(current))
+
+ckpt_path = STEP6 / 'Models' / 'Best_HH_Dynamics_Classifier.pt'
+scaler_path = STEP6 / 'Models' / 'HH_TrainOnly_Scaler.joblib'
+for p in (ckpt_path, scaler_path):
+    if not p.is_file(): raise FileNotFoundError(f'Run full Step 6 first: {p}')
+try:
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+except TypeError:
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+if tuple(ckpt['classes']) != CLASSES:
+    raise ValueError(f'Step 6 class order unexpected: {ckpt["classes"]}')
+model = HHDynamicsClassifier(
+    in_dim=int(ckpt.get('input_dim', 768)),
+    neurons=int(ckpt.get('neurons', 256)),
+    n_classes=len(CLASSES),
+    steps=int(ckpt.get('time_steps', 20)),
+    dt=float(ckpt.get('dt_ms', 0.05))).to(DEVICE)
+model.load_state_dict(ckpt['state_dict'], strict=True)
+model.eval()
+transform = joblib.load(scaler_path)
+scaler = transform['scaler']
+cols = list(transform.get('columns', [f'Fusion_{i:03d}' for i in range(768)]))
+if len(cols) != 768: raise ValueError('Step 6 scaler needs 768 ordered features')
+
+# ------ Load fused features; ensure saved predictions still match --
+def load_split(split):
+    f = STEP5 / f'{split}_Fused_768D.csv'
+    p = STEP6 / 'Reports' / f'{split}_Predictions.csv'
+    if not f.is_file() or not p.is_file():
+        raise FileNotFoundError(f'Missing Step 5 features or Step 6 predictions for {split}')
+    a = pd.read_csv(f, dtype={'Lesion_ID': str})
+    b = pd.read_csv(p, dtype={'Lesion_ID': str})
+    for d in (a, b):
+        d['Lesion_ID'] = d['Lesion_ID'].astype(str).str.strip()
+        if d['Lesion_ID'].duplicated().any(): raise ValueError(f'{split}: duplicate Lesion_ID')
+    if set(a.Lesion_ID) != set(b.Lesion_ID):
+        raise ValueError(f'{split}: Step 5 and Step 6 lesion sets differ')
+    b = b.set_index('Lesion_ID').loc[a.Lesion_ID].reset_index()
+    if not (a.Diagnosis.to_numpy() == b.Diagnosis.to_numpy()).all():
+        raise ValueError(f'{split}: Step 5/6 diagnosis disagreement')
+    values = a[cols].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=np.float32)
+    if not np.isfinite(values).all(): raise ValueError(f'{split}: invalid features')
+    X = scaler.transform(values).astype(np.float32)
+    if not np.isfinite(X).all(): raise ValueError(f'{split}: bad scaled features')
+    return a, b, X
+
+train_df, train_predictions, train_X = load_split('Train')
+test_df, test_predictions, test_X = load_split('Test')
+if len(test_X) == 0: raise ValueError('Empty test split')
+indices = np.linspace(0, len(test_X)-1,
+                      min(MAX_TEST_EXPLANATIONS, len(test_X)), dtype=int)
+indices = np.unique(indices)
+X = test_X[indices]
+selected = test_predictions.iloc[indices].reset_index(drop=True)
+print('Explaining test lesions:', len(indices), 'of', len(test_X))
+
+@torch.no_grad()
+def probabilities(x, batch_size=64):
+    out=[]
+    for i in range(0,len(x),batch_size):
+        z=torch.from_numpy(np.asarray(x[i:i+batch_size],dtype=np.float32)).to(DEVICE)
+        out.append(model(z).softmax(-1).cpu().numpy())
+    return np.vstack(out)
+
+p_now = probabilities(X)
+p_saved = selected[[f'Probability_{c}' for c in CLASSES]].to_numpy(dtype=float)
+if not np.allclose(p_now, p_saved, rtol=2e-3, atol=2e-3):
+    raise RuntimeError('Reloaded HH model does NOT reproduce saved Step 6 probabilities. '
+                       'Do not explain a mismatched checkpoint.')
+
+# ------ IG for each lesion's predicted diagnosis logit ------------
+# Baseline: training mean in the same standardized 768-D feature space.
+# IG is computed on logits, not probabilities (reduces softmax saturation).
+baseline = train_X.mean(axis=0).astype(np.float32)
+
+def integrated_gradients(x, target, base, steps=32):
+    x_t = torch.as_tensor(x, device=DEVICE, dtype=torch.float32)
+    base_t = torch.as_tensor(base, device=DEVICE, dtype=torch.float32)
+    delta = x_t - base_t
+    accumulated = torch.zeros_like(x_t)
+    for step in range(steps + 1):
+        alpha = step / steps
+        z = (base_t + alpha * delta).detach().requires_grad_(True)
+        logits = model(z.unsqueeze(0))
+        grad = torch.autograd.grad(logits[0, target], z)[0]
+        factor = 0.5 if step in (0, steps) else 1.0
+        accumulated = accumulated + factor * grad.detach()
+    return (delta * accumulated / steps).cpu().numpy()
+
+all_ig=[]; details=[]
+for i, (lesion, prob) in enumerate(zip(X, p_now)):
+    target = int(np.argmax(prob))
+    attr = integrated_gradients(lesion, target, baseline, IG_STEPS)
+    all_ig.append(attr)
+    with torch.no_grad():
+        f_x = model(torch.as_tensor(lesion[None],device=DEVICE)).cpu().numpy()[0,target]
+        f_b = model(torch.as_tensor(baseline[None],device=DEVICE)).cpu().numpy()[0,target]
+    details.append({'Lesion_ID':selected.loc[i,'Lesion_ID'],
+                    'Actual_Diagnosis':selected.loc[i,'Diagnosis'],
+                    'Predicted_Diagnosis':CLASSES[target],
+                    'Predicted_Confidence':float(prob[target]),
+                    'IG_Logit_Difference':float(f_x-f_b),
+                    'IG_Attribution_Sum':float(attr.sum()),
+                    'IG_Completeness_Error':float(abs((f_x-f_b)-attr.sum()))})
+IG = np.asarray(all_ig,dtype=np.float32)
+ig_table = pd.DataFrame(IG,columns=cols)
+ig_table.insert(0,'Lesion_ID',selected.Lesion_ID.to_numpy())
+ig_table.to_csv(REPORT/'Test_Integrated_Gradients_768D.csv',index=False)
+
+# ------ Exact SHAP-style Shapley values for 3 modality groups ------
+# All 8 coalitions, averaged over the 6 permutations. The masked
+# modality is replaced with its TRAIN mean. Target is predicted-class
+# LOGIT (not probability). Values sum to model(x)-model(baseline).
+permutations = list(itertools.permutations(range(3)))
+slices = list(GROUPS.values())
+shap_rows=[]; ig_group_rows=[]
+for i, lesion in enumerate(X):
+    target = int(p_now[i].argmax())
+    coalitions = list(itertools.product((0,1),repeat=3))
+    masked = np.repeat(baseline[None,:],len(coalitions),axis=0)
+    for k, coalition in enumerate(coalitions):
+        for j, is_present in enumerate(coalition):
+            if is_present: masked[k,slices[j]]=lesion[slices[j]]
+    with torch.no_grad():
+        logits = model(torch.as_tensor(masked,dtype=torch.float32,device=DEVICE))
+        values = logits[:,target].cpu().numpy()
+    lookup = {coalitions[k]:float(values[k]) for k in range(len(coalitions))}
+    contrib=np.zeros(3,dtype=np.float64)
+    for perm in permutations:
+        coalition=[0,0,0]
+        before = lookup[tuple(coalition)]
+        for j in perm:
+            coalition[j]=1
+            after=lookup[tuple(coalition)]
+            contrib[j] += after-before
+            before=after
+    contrib/=len(permutations)
+    row={'Lesion_ID':selected.loc[i,'Lesion_ID'],
+         'Actual_Diagnosis':selected.loc[i,'Diagnosis'],
+         'Predicted_Diagnosis':CLASSES[target],
+         'Reference_Baseline_Logit':lookup[(0,0,0)],
+         'Full_Input_Logit':lookup[(1,1,1)],
+         'SHAP_Completeness_Error':float(abs(contrib.sum()-(lookup[(1,1,1)]-lookup[(0,0,0)])))}
+    grow={'Lesion_ID':selected.loc[i,'Lesion_ID']}
+    for j, name in enumerate(GROUPS):
+        row[f'Shapley_{name}']=float(contrib[j])
+        grow[f'IG_{name}_Signed']=float(IG[i,slices[j]].sum())
+        grow[f'IG_{name}_Absolute']=float(np.abs(IG[i,slices[j]]).sum())
+    shap_rows.append(row); ig_group_rows.append(grow)
+
+pd.DataFrame(shap_rows).to_csv(REPORT/'Test_Modality_Group_Shapley.csv',index=False)
+pd.DataFrame(ig_group_rows).to_csv(REPORT/'Test_Modality_IG_Summary.csv',index=False)
+pd.DataFrame(details).to_csv(REPORT/'Test_IG_Completeness_Audit.csv',index=False)
+
+# ------ Visualization ---------------------------------------------
+fig,ax=plt.subplots(figsize=(9,4.5))
+means=[np.abs(IG[:, sl]).sum(axis=1).mean() for sl in GROUPS.values()]
+ax.bar(list(GROUPS.keys()),means)
+ax.set(ylabel='Mean sum of absolute IG attributions',
+       title='HH-SNN: Modality Contributions (Test Sample)')
+fig.tight_layout();fig.savefig(VIS/'Modality_IG_Importance.png',dpi=170)
+plt.show();plt.close(fig)
+
+sh=pd.DataFrame(shap_rows)
+fig,ax=plt.subplots(figsize=(9,4.5))
+means=[np.abs(sh[f'Shapley_{name}']).mean() for name in GROUPS]
+ax.bar(list(GROUPS),means)
+ax.set(ylabel='Mean absolute modality Shapley value (logits)',
+       title='HH-SNN: Exact 3-Group Shapley Attributions')
+fig.tight_layout();fig.savefig(VIS/'Modality_Shapley_Importance.png',dpi=170)
+plt.show();plt.close(fig)
+
+fig,ax=plt.subplots(figsize=(12,max(3.5,min(len(IG)*0.35+1,10))))
+heat=ax.imshow(IG,aspect='auto',cmap='coolwarm')
+ax.axvline(255.5,linestyle='--',color='black',linewidth=1)
+ax.axvline(511.5,linestyle='--',color='black',linewidth=1)
+ax.set_xticks([127,383,639],['Dermoscopic','Clinical','Metadata'])
+ax.set(ylabel='Explained test-lesion index',title='Integrated Gradients: 768-D Fused Features')
+fig.colorbar(heat,ax=ax,label='Signed IG contribution')
+fig.tight_layout();fig.savefig(VIS/'Test_IG_Heatmap.png',dpi=170)
+plt.show();plt.close(fig)
+
+fig,ax=plt.subplots(figsize=(8,4.5))
+ax.hist(pd.DataFrame(details)['IG_Completeness_Error'].to_numpy(),bins=12)
+ax.set(xlabel='Absolute completeness error (logit)',ylabel='Number of lesions',
+       title='Integrated Gradients Completeness Diagnostic')
+fig.tight_layout();fig.savefig(VIS/'IG_Completeness_Diagnostic.png',dpi=170)
+plt.show();plt.close(fig)
+
+summary={
+    'model':'Step 6 frozen HH-dynamics-inspired 5-class classifier',
+    'explanation_split':'Test',
+    'test_total':int(len(test_X)),
+    'test_explained':int(len(X)),
+    'sample_selection':'Evenly spaced indices in existing test file (not all test lesions unless count permits)',
+    'ig_steps':IG_STEPS,
+    'ig_target':'Predicted class logit',
+    'ig_baseline':'Training mean of 768-D inputs after Step 6 training-only scaler',
+    'shap_method':'Exact interventional three-group Shapley over 8 modality coalitions; training-mean masking',
+    'shap_target':'Predicted class logit',
+    'group_order':['Dermoscopic 0:256','Clinical 256:512','Metadata 512:768'],
+    'gradcam':'NOT GENERATED — image encoders are frozen and not linked differentiably to HH-SNN classifier; needs an integrated image-to-prediction graph',
+    'mean_ig_completeness_error':float(np.mean([r['IG_Completeness_Error'] for r in details])),
+    'max_group_shapley_completeness_error':float(np.max([r['SHAP_Completeness_Error'] for r in shap_rows])),
+    'notes':[
+        'These explanations operate on learned fusion coordinates, not lesion pixels.',
+        'Signed IG and group Shapley contributions are for predicted-class logits.',
+        'Correlated modalities and training-mean masking limit causal interpretation.',
+        'The HH model is an HH-dynamics-inspired surrogate, not an exact paper replication.',
+        'Explanations describe model behavior and do not clinically validate diagnoses.']}
+with open(REPORT/'Step8_Explainability_Summary.json','w') as f:
+    json.dump(summary,f,indent=2)
+print('\nSTEP 8 COMPLETED — Integrated Gradients + 3-group Shapley')
+print('Explained samples:',len(X))
+print('Mean IG completeness error:',summary['mean_ig_completeness_error'])
+print('Output:',OUT)
+print('Grad-CAM: not available with the separately trained encoders and HH classifier.')
