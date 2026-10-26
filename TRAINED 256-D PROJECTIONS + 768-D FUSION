@@ -1,0 +1,390 @@
+# ================================================================
+# DERM7PT — STEP 5: TRAINED 256-D PROJECTIONS + 768-D FUSION
+# Full-dataset Google Colab code, compatible with Step 4 full features
+# No HH-SNN training in this step; that is Step 6.
+# ================================================================
+# Colab dependency (run in a separate cell if needed):
+# %pip -q install tensorflow scikit-learn joblib pandas matplotlib
+
+from pathlib import Path
+import os, re, json, random, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+import tensorflow as tf
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+
+SEED = 42
+EPOCHS = 60
+BATCH_SIZE = 32
+LR = 1e-4
+PROJECTION_DIM = 256
+DROPOUT = 0.15
+SPLITS = ('Train', 'Validation', 'Test')
+CLASSES = ('Nevus', 'Melanoma', 'MISC', 'SK', 'BCC')
+REQUIRE_ALL_TRAIN_CLASSES = True
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+
+# --------------------- GOOGLE DRIVE ------------------------------
+from google.colab import drive
+mydrive = None
+for mount in (Path('/content/drive'), Path('/content/gdrive')):
+    candidate = mount / 'MyDrive'
+    if (candidate / 'Derm7pt').is_dir():
+        mydrive = candidate
+        break
+if mydrive is None:
+    for mount in (Path('/content/drive'), Path('/content/gdrive')):
+        mount.mkdir(parents=True, exist_ok=True)
+        if not os.path.ismount(str(mount)):
+            if any(mount.iterdir()):
+                continue
+            drive.mount(str(mount), force_remount=False)
+        candidate = mount / 'MyDrive'
+        if (candidate / 'Derm7pt').is_dir():
+            mydrive = candidate
+            break
+if mydrive is None:
+    raise FileNotFoundError('Unable to locate Google Drive/MyDrive/Derm7pt. Mount Drive and check the folder name.')
+
+BASE = mydrive / 'Derm7pt'
+PREP = BASE / 'Derm7pt_Preprocessed'
+STEP4 = PREP / 'Step4_Full_Modality_Features'
+OUT = PREP / 'Step5_Full_768D_Learned_Fusion'
+MODEL_DIR, REPORT_DIR, VIS_DIR = (OUT / n for n in ('Models', 'Reports', 'Visualizations'))
+for p in (OUT, MODEL_DIR, REPORT_DIR, VIS_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+if not STEP4.is_dir():
+    raise FileNotFoundError(f'Step 4 full-dataset features missing: {STEP4}')
+
+# --------------------- LABEL GROUPING ----------------------------
+# Clinically chosen research grouping. Audit all diagnoses before training.
+# MISC is deliberately explicit, never a catch-all for unknown diagnoses.
+DIAGNOSIS_MAP = {
+
+    # CLASS 1: NEVUS
+    "nevus": "Nevus",
+    "melanocytic nevus": "Nevus",
+    "blue nevus": "Nevus",
+    "clark nevus": "Nevus",
+    "combined nevus": "Nevus",
+    "congenital nevus": "Nevus",
+    "dermal nevus": "Nevus",
+    "compound nevus": "Nevus",
+    "junctional nevus": "Nevus",
+    "recurrent nevus": "Nevus",
+    "reed or spitz nevus": "Nevus",
+
+    # CLASS 2: MELANOMA
+    "melanoma": "Melanoma",
+    "melanoma (in situ)": "Melanoma",
+    "melanoma in situ": "Melanoma",
+    "melanoma (less than 0.76 mm)": "Melanoma",
+    "melanoma (0.76 to 1.5 mm)": "Melanoma",
+    "melanoma (more than 1.5 mm)": "Melanoma",
+    "melanoma metastasis": "Melanoma",
+
+    # CLASS 3: BASAL CELL CARCINOMA
+    "basal cell carcinoma": "BCC",
+    "bcc": "BCC",
+
+    # CLASS 4: SEBORRHEIC KERATOSIS
+    "seborrheic keratosis": "SK",
+    "seborrhoeic keratosis": "SK",
+    "sk": "SK",
+
+    # CLASS 5: MISCELLANEOUS
+    "miscellaneous": "MISC",
+    "misc": "MISC",
+    "dermatofibroma": "MISC",
+    "vascular lesion": "MISC",
+    "lentigo": "MISC",
+    "melanosis": "MISC",
+}
+
+print("Updated diagnosis mapping loaded.")
+print("Mapped original labels:", len(DIAGNOSIS_MAP))
+
+def clean_id(value):
+    if pd.isna(value):
+        return ''
+    v = str(value).strip()
+    return v[:-2] if re.fullmatch(r'\d+\.0', v) else v
+
+def find_col(df, options):
+    lookup = {str(c).casefold(): c for c in df.columns}
+    for c in options:
+        if c.casefold() in lookup:
+            return lookup[c.casefold()]
+    return None
+
+def normalize_label(v):
+    return ' '.join(str(v).strip().lower().split())
+
+# --------------------- READ MANIFEST AND LABELS ------------------
+manifest = {}
+all_ids = {}
+unknown_by_split = {}
+for split in SPLITS:
+    filename = PREP / f'09_{split}_Image_Manifest.csv'
+    if not filename.is_file():
+        raise FileNotFoundError(f'Missing original manifest: {filename}')
+    frame = pd.read_csv(filename, dtype=str)
+    id_col = find_col(frame, ('Lesion_ID', 'case_num', 'Case_ID'))
+    label_col = find_col(frame, ('Diagnosis', 'diagnosis'))
+    if id_col is None or label_col is None:
+        raise ValueError(f'{filename.name}: needs Lesion_ID and Diagnosis columns. Found {list(frame.columns)}')
+    m = pd.DataFrame({
+        'Lesion_ID': frame[id_col].map(clean_id),
+        'Original_Diagnosis': frame[label_col].astype(str),
+    })
+    if m.Lesion_ID.eq('').any() or m.Lesion_ID.duplicated().any():
+        raise ValueError(f'{split}: missing/duplicate Lesion_ID')
+    normalized = m.Original_Diagnosis.map(normalize_label)
+    m['Diagnosis'] = normalized.map(DIAGNOSIS_MAP)
+    missing_labels = sorted(normalized[m.Diagnosis.isna()].unique())
+    if missing_labels:
+        raise ValueError(
+            f'{split}: unmapped original diagnoses: {missing_labels}. '
+            'Update DIAGNOSIS_MAP after checking the Derm7pt taxonomy; do not assign unknowns automatically.'
+        )
+    m['Split'] = split
+    manifest[split] = m
+    all_ids[split] = set(m.Lesion_ID)
+    print(f'{split} class counts: {m.Diagnosis.value_counts().to_dict()}')
+
+for i, a in enumerate(SPLITS):
+    for b in SPLITS[i+1:]:
+        repeated = all_ids[a] & all_ids[b]
+        if repeated:
+            raise ValueError(f'Lesion leakage between {a} and {b}: {sorted(repeated)[:15]}')
+
+train_labels = set(manifest['Train'].Diagnosis)
+missing_train = sorted(set(CLASSES) - train_labels)
+if REQUIRE_ALL_TRAIN_CLASSES and missing_train:
+    raise ValueError(f'Training data missing classes {missing_train}; use the full original train split, not the 15-image subset.')
+
+# --------------------- FEATURE LOADING BY LESION_ID -------------
+BRANCHES = {
+    'derm': ('{split}_ViT_Swin_Dermoscopic_Features.csv', 'd_'),
+    'clinical': ('{split}_ConvNeXt_ViT_Clinical_Features.csv', 'c_'),
+    'metadata': ('{split}_FTTransformer_Aligned_Metadata_Embeddings.csv', 'm_'),
+}
+
+def read_features(split, branch):
+    pattern, prefix = BRANCHES[branch]
+    path = STEP4 / pattern.format(split=split)
+    if not path.is_file():
+        raise FileNotFoundError(f'Missing Step 4 {branch} features: {path}')
+    feat = pd.read_csv(path, dtype={'Lesion_ID': str})
+    col = find_col(feat, ('Lesion_ID', 'lesion_id', 'case_num'))
+    if col is None:
+        raise ValueError(f'{path.name} has no lesion ID; row-order joining is forbidden.')
+    feat['Lesion_ID'] = feat[col].map(clean_id)
+    if feat.Lesion_ID.eq('').any() or feat.Lesion_ID.duplicated().any():
+        raise ValueError(f'{path.name}: missing or duplicate IDs')
+    # Only accept feature columns, not label/target/control fields.
+    ignore = {col, 'Lesion_ID', 'Split', 'Diagnosis', 'Diagnosis_Code',
+              'Original_Diagnosis', 'Original_Row', 'Is_Augmented', 'target', 'label'}
+    candidate_cols = [c for c in feat.columns if c not in ignore]
+    if not candidate_cols:
+        raise ValueError(f'{path.name}: no numeric feature columns')
+    # Strictly require a consistent schema from the same Step 4 encoder.
+    for c in candidate_cols:
+        feat[c] = pd.to_numeric(feat[c], errors='coerce')
+    feat = feat[['Lesion_ID'] + candidate_cols].copy()
+    return feat.rename(columns={c: prefix+str(c) for c in candidate_cols})
+
+joined = {}
+schema = {}
+audit_rows = []
+for split in SPLITS:
+    merged = manifest[split].copy()
+    for branch in BRANCHES:
+        feat = read_features(split, branch)
+        feat_cols = [c for c in feat.columns if c != 'Lesion_ID']
+        if split == 'Train':
+            schema[branch] = feat_cols
+        elif feat_cols != schema[branch]:
+            raise ValueError(f'{split}/{branch}: feature columns differ from training; rerun Step 4 consistently.')
+        merged = merged.merge(feat, on='Lesion_ID', how='left', validate='one_to_one')
+        numeric = merged[feat_cols].apply(pd.to_numeric, errors='coerce')
+        merged[f'Has_{branch}'] = numeric.notna().any(axis=1)
+    joined[split] = merged
+    a = merged[['Lesion_ID', 'Split', 'Diagnosis', 'Has_derm', 'Has_clinical', 'Has_metadata']].copy()
+    a['Complete_Three_Modalities'] = a[['Has_derm', 'Has_clinical', 'Has_metadata']].all(axis=1)
+    audit_rows.append(a)
+    print(f'{split}: records={len(merged)}; complete modalities={int(a.Complete_Three_Modalities.sum())}')
+
+availability = pd.concat(audit_rows, ignore_index=True)
+availability.to_csv(REPORT_DIR / 'Step5_Fusion_Matching_Audit.csv', index=False)
+
+# --------------------- FIT TRAIN-ONLY PREPROCESSING -------------
+# Missing branch: zero vector AFTER centering/scaling, with availability flag.
+# Missing individual numeric values: training-median imputation.
+transforms = {}
+arrays = {split: {} for split in SPLITS}
+for branch in BRANCHES:
+    columns = schema[branch]
+    train_x = joined['Train'][columns].to_numpy(dtype=np.float32)
+    if not np.isfinite(train_x).any():
+        raise ValueError(f'No usable training features in {branch} branch.')
+    # Avoid treating inf as valid observations.
+    train_x[~np.isfinite(train_x)] = np.nan
+    all_nan_cols = np.isnan(train_x).all(axis=0)
+    if all_nan_cols.any():
+        raise ValueError(f'{branch}: {int(all_nan_cols.sum())} feature columns entirely missing in train. Fix Step 4.')
+    imp = SimpleImputer(strategy='median', keep_empty_features=True)
+    sc = StandardScaler()
+    sc.fit(imp.fit_transform(train_x))
+    transforms[branch] = {'imputer': imp, 'scaler': sc, 'columns': columns}
+    for split in SPLITS:
+        x = joined[split][columns].to_numpy(dtype=np.float32)
+        x[~np.isfinite(x)] = np.nan
+        missing_modality = ~joined[split][f'Has_{branch}'].to_numpy(dtype=bool)
+        processed = sc.transform(imp.transform(x)).astype(np.float32)
+        processed[missing_modality] = 0.0  # neutral standardized vector
+        if not np.isfinite(processed).all():
+            raise ValueError(f'Nonfinite features remain in {split}/{branch}')
+        arrays[split][branch] = processed
+        arrays[split][f'has_{branch}'] = (~missing_modality).astype(np.float32)[:, None]
+
+# --------------------- TRAINABLE PROJECTION + AUXILIARY HEAD ----
+# The auxiliary diagnosis head supplies supervised gradients that learn
+# projections on TRAIN only; it is NOT the later HH-SNN classifier.
+# Validation is only for early stopping; test labels are never used to fit.
+L = tf.keras.layers
+input_layers = {}
+projection_layers = []
+availability_layers = []
+for branch in BRANCHES:
+    dim = len(schema[branch])
+    inp = L.Input(shape=(dim,), name=f'{branch}_input')
+    present = L.Input(shape=(1,), name=f'{branch}_present')
+    x = L.Dense(PROJECTION_DIM, activation='gelu', name=f'{branch}_projection')(inp)
+    # Mask the projection INCLUDING its bias when modality unavailable.
+    projected = L.Multiply(name=f'{branch}_masked')([x, present])
+    input_layers[branch] = inp
+    input_layers[f'has_{branch}'] = present
+    projection_layers.append(projected)
+    availability_layers.append(present)
+
+fusion = L.Concatenate(name='fused_768d')(projection_layers)
+flags = L.Concatenate(name='availability_flags')(availability_layers)
+x = L.Concatenate(name='fusion_with_flags')([fusion, flags])
+x = L.Dense(128, activation='gelu', name='aux_hidden')(x)
+x = L.Dropout(DROPOUT, name='aux_dropout')(x)
+output = L.Dense(len(CLASSES), activation='softmax', name='aux_diagnosis')(x)
+ordered_inputs = [input_layers[k] for k in
+                  ('derm','has_derm','clinical','has_clinical','metadata','has_metadata')]
+trainer = tf.keras.Model(ordered_inputs, output, name='Derm7pt_Trainable_Fusion')
+projector = tf.keras.Model(ordered_inputs, fusion, name='Derm7pt_768D_Projector')
+trainer.compile(optimizer=tf.keras.optimizers.Adam(LR),
+                loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+trainer.summary()
+
+class_to_int = {c: i for i, c in enumerate(CLASSES)}
+y = {s: joined[s].Diagnosis.map(class_to_int).to_numpy(dtype=np.int32) for s in SPLITS}
+
+def as_inputs(split):
+    d = arrays[split]
+    return [d['derm'], d['has_derm'], d['clinical'], d['has_clinical'],
+            d['metadata'], d['has_metadata']]
+
+train_counts = np.bincount(y['Train'], minlength=len(CLASSES))
+weights = {i: len(y['Train']) / (len(CLASSES) * max(int(n), 1))
+           for i, n in enumerate(train_counts)}
+
+best = MODEL_DIR / 'Best_Trainable_Fusion.keras'
+callbacks = [
+    tf.keras.callbacks.ModelCheckpoint(str(best), save_best_only=True,
+                                       monitor='val_loss', mode='min', verbose=1),
+    tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=9,
+                                     restore_best_weights=True),
+    tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=.5,
+                                         patience=4, min_lr=1e-6),
+    tf.keras.callbacks.CSVLogger(str(REPORT_DIR / 'Fusion_Training_Log.csv')),
+]
+print('Training three learned 256-D projections...')
+history = trainer.fit(
+    as_inputs('Train'), y['Train'],
+    validation_data=(as_inputs('Validation'), y['Validation']),
+    epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=callbacks,
+    class_weight=weights, verbose=2,
+)
+
+# Rebuild projection submodel sharing loaded best weights.
+trainer = tf.keras.models.load_model(best, compile=False)
+projector = tf.keras.Model(inputs=trainer.inputs,
+                           outputs=trainer.get_layer('fused_768d').output,
+                           name='Derm7pt_768D_Projector')
+projector.save(MODEL_DIR / 'Best_768D_Projector.keras')
+joblib.dump(transforms, MODEL_DIR / 'Train_Fitted_Feature_Preprocessing.joblib')
+
+# --------------------- EXPORT LEARNED 768-D FEATURES ------------
+summary = {'classes': list(CLASSES), 'projection_dim': PROJECTION_DIM,
+           'fused_dim': PROJECTION_DIM * len(BRANCHES),
+           'training_samples': len(joined['Train']), 'splits': {},
+           'image_feature_sources': 'Frozen independent pretrained image backbones from Step 4',
+           'learning': 'Supervised auxiliary diagnosis head; trained projections only; HH-SNN not trained here',
+           'notes': [
+               'All modality joining performed by Lesion_ID, not row order.',
+               'Missing modality masks and imputation learned from training only.',
+               'No features synthesized for absent modalities.',
+               'This is an auxiliary-supervised projection baseline, not the exact PDF end-to-end encoder architecture.',
+               'Projected test features depend on train labels and validation-based checkpoint selection, not test labels.',
+           ]}
+for split in SPLITS:
+    vectors = projector.predict(as_inputs(split), batch_size=128, verbose=0)
+    vectors = np.asarray(vectors, dtype=np.float32)
+    if vectors.shape != (len(joined[split]), 768):
+        raise RuntimeError(f'{split} unexpected fused shape: {vectors.shape}')
+    if not np.isfinite(vectors).all():
+        raise RuntimeError(f'{split} contains nonfinite fused features')
+    output_df = pd.DataFrame(vectors, columns=[f'Fusion_{i:03d}' for i in range(768)])
+    output_df.insert(0, 'Lesion_ID', joined[split].Lesion_ID.to_numpy())
+    output_df.insert(1, 'Diagnosis', joined[split].Diagnosis.to_numpy())
+    output_df.insert(2, 'Split', split)
+    csv_file = OUT / f'{split}_Fused_768D.csv'
+    output_df.to_csv(csv_file, index=False)
+    np.savez_compressed(OUT / f'{split}_Fused_768D.npz', X=vectors,
+                        y=y[split], Lesion_ID=joined[split].Lesion_ID.to_numpy(dtype=str),
+                        classes=np.asarray(CLASSES))
+    summary['splits'][split] = {'records': int(len(vectors)), 'feature_dim':768,
+                                 'class_counts': joined[split].Diagnosis.value_counts().to_dict(),
+                                 'complete_modality_records': int(availability.loc[
+                                     availability.Split.eq(split), 'Complete_Three_Modalities'].sum()),
+                                 'file': str(csv_file)}
+    print(f'{split}: fused features {vectors.shape} -> {csv_file}')
+
+with open(REPORT_DIR / 'Step5_Fusion_Summary.json', 'w') as f:
+    json.dump(summary, f, indent=2)
+with open(REPORT_DIR / 'Class_Mapping.json', 'w') as f:
+    json.dump(class_to_int, f, indent=2)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+axes[0].plot(history.history['loss'], label='Train')
+axes[0].plot(history.history['val_loss'], label='Validation')
+axes[0].set(title='Auxiliary projection training loss', xlabel='Epoch', ylabel='Loss')
+axes[0].legend()
+axes[1].plot(history.history['accuracy'], label='Train')
+axes[1].plot(history.history['val_accuracy'], label='Validation')
+axes[1].set(title='Auxiliary head accuracy', xlabel='Epoch', ylabel='Accuracy')
+axes[1].legend()
+fig.tight_layout()
+fig.savefig(VIS_DIR / 'Step5_Projection_Training_Curves.png', dpi=160)
+plt.show()
+plt.close(fig)
+
+print('\nSTEP 5 FINISHED — TRAINED 768-D FUSION')
+print('Outputs:', OUT)
+print('Audit:', REPORT_DIR / 'Step5_Fusion_Matching_Audit.csv')
+print('Next: STEP 6 — train five-class HH-SNN on full Train_Fused_768D.csv,')
+print('validate on Validation_Fused_768D.csv, and evaluate on Test_Fused_768D.csv.')
