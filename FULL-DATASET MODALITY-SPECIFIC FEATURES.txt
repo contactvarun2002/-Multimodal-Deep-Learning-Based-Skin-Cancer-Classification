@@ -1,0 +1,438 @@
+# ================================================================
+# DERM7PT — STEP 4: FULL-DATASET MODALITY-SPECIFIC FEATURES
+# Dermoscopic: pretrained ViT + Swin backbones (concatenation)
+# Clinical: pretrained ConvNeXt + ViT backbones (concatenation)
+# Metadata: align existing FT-Transformer embeddings by Lesion_ID
+#
+# IMPORTANT
+# - Processes ALL available lesion records in ORIGINAL split manifests.
+# - Does not use the old 15-image Step3D subset.
+# - ImageNet-pretrained feature extractors are FROZEN, not trained
+#   end-to-end or exact custom paper-defined hybrid encoders.
+# - Does not train a classifier or learn 256-dimensional projections.
+# - Uses original images by default. Lesion-focused images are used
+#   only where valid full-dataset segmentation manifests exist.
+# - Missing modalities remain explicitly flagged, NOT silently dropped.
+# - Segmentation masks generated using ISIC dermoscopy may not be
+#   valid for clinical photos; no clinical masks assumed here.
+# ================================================================
+
+# In Colab, run once if needed:
+# %pip -q install -U timm pillow pandas numpy matplotlib tqdm
+
+import os, json, re, gc, random, warnings
+from pathlib import Path
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageOps, ImageFile
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import torch
+from torch.utils.data import Dataset, DataLoader
+import timm
+
+SEED = 42
+IMG_SIZE = 224
+BATCH_SIZE = 8            # set 4 or 2 if GPU memory is low
+NUM_WORKERS = 2          # use 0 if Colab/DataLoader errors occur
+USE_AMP = True
+USE_LESION_FOCUSED_DERMOSCOPY = True
+USE_LESION_FOCUSED_CLINICAL = False  # enable ONLY with validated full clinical masks
+OVERWRITE_EXISTING_FEATURES = False
+EXPORT_PER_SPLIT_CSV = True
+SPLITS = ("Train", "Validation", "Test")
+
+# These are independently pretrained architectures paired at feature level:
+DERM_MODELS = ("vit_tiny_patch16_224", "swin_tiny_patch4_window7_224")
+CLIN_MODELS = ("convnext_tiny", "vit_tiny_patch16_224")
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if device.type == 'cuda':
+    torch.backends.cudnn.benchmark = True
+print('Device:', device)
+
+# --------------------- Resolve Google Drive ---------------------
+from google.colab import drive
+mydrive = None
+for mount in (Path('/content/drive'), Path('/content/gdrive')):
+    root = mount / 'MyDrive'
+    if (root / 'Derm7pt').is_dir():
+        mydrive = root
+        break
+if mydrive is None:
+    for mount in (Path('/content/drive'), Path('/content/gdrive')):
+        mount.mkdir(parents=True, exist_ok=True)
+        if not os.path.ismount(str(mount)):
+            if any(mount.iterdir()):
+                continue
+            drive.mount(str(mount), force_remount=False)
+        root = mount / 'MyDrive'
+        if (root / 'Derm7pt').is_dir():
+            mydrive = root
+            break
+if mydrive is None:
+    raise FileNotFoundError('Google Drive/Derm7pt not found. Mount Drive or correct the project path.')
+
+BASE = mydrive / 'Derm7pt'
+ROOT = BASE / 'release_v0'
+PREP = BASE / 'Derm7pt_Preprocessed'
+SEG = BASE / 'Step3_LCTSNet'
+OUT = PREP / 'Step4_Full_Modality_Features'
+RAW = OUT / 'Raw_Features'
+REPORT = OUT / 'Reports'
+VIS = OUT / 'Visualizations'
+for p in (OUT, RAW, REPORT, VIS):
+    p.mkdir(parents=True, exist_ok=True)
+
+print('Project:', BASE)
+print('Outputs:', OUT)
+
+# --------------------- Utilities ---------------------
+def find_col(df, candidates):
+    lookup = {str(c).casefold(): c for c in df.columns}
+    for c in candidates:
+        if c.casefold() in lookup:
+            return lookup[c.casefold()]
+    return None
+
+def clean_id(s):
+    if pd.isna(s):
+        return ''
+    v = str(s).strip()
+    # Repair float-rendered integer identifiers only.
+    return v[:-2] if re.fullmatch(r'\d+\.0', v) else v
+
+def candidate_path(raw, modality, lesion_id):
+    if raw is None or pd.isna(raw):
+        raw = ''
+    raw = str(raw).strip().replace('\\', '/')
+    modality_folder = 'Dermoscopic' if modality == 'derm' else 'Clinical'
+    paths = []
+    if raw:
+        p = Path(raw)
+        if p.is_absolute():
+            paths.append(p)
+        else:
+            paths.extend((PREP / p, PREP / 'Images' / modality_folder / p.name,
+                          PREP / 'images' / modality_folder.lower() / p.name,
+                          ROOT / 'images' / p, ROOT / 'images' / p.name))
+    for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
+        paths.append(PREP / 'Images' / modality_folder / f'{lesion_id}{ext}')
+    return next((p for p in paths if p.is_file()), None)
+
+def resolve_saved_path(v):
+    if pd.isna(v) or not str(v).strip():
+        return None
+    raw = Path(str(v).strip().replace('\\','/'))
+    options = [raw] if raw.is_absolute() else [BASE / raw, PREP / raw, SEG / raw]
+    return next((p for p in options if p.is_file()), None)
+
+# --------------------- Original split manifests ---------------------
+all_manifest = []
+for split in SPLITS:
+    file = PREP / f'09_{split}_Image_Manifest.csv'
+    if not file.is_file():
+        raise FileNotFoundError(f'Original split manifest missing: {file}')
+    df = pd.read_csv(file, dtype=str, keep_default_na=True)
+    id_col = find_col(df, ('Lesion_ID','lesion_id','case_num','Case_ID'))
+    derm_col = find_col(df, ('Dermoscopic_Image','Dermoscopic_Path','derm','dermoscopic_image','derm_path'))
+    clin_col = find_col(df, ('Clinical_Image','Clinical_Path','clinic','clinical_image','clinic_path'))
+    if id_col is None or derm_col is None or clin_col is None:
+        raise ValueError(f'{file.name}: missing ID or image columns; found {df.columns.tolist()}')
+    df = df.copy()
+    df['Lesion_ID'] = df[id_col].map(clean_id)
+    if df['Lesion_ID'].eq('').any() or df['Lesion_ID'].duplicated().any():
+        raise ValueError(f'{file.name}: empty or duplicate Lesion_ID')
+    df['Split'] = split
+    df['Dermoscopic_Source'] = [str(candidate_path(v,'derm',lesion) or '') for v,lesion in zip(df[derm_col],df['Lesion_ID'])]
+    df['Clinical_Source'] = [str(candidate_path(v,'clinical',lesion) or '') for v,lesion in zip(df[clin_col],df['Lesion_ID'])]
+    all_manifest.append(df)
+    print(f'{split}: total={len(df)}, derm={df.Dermoscopic_Source.ne("").sum()}, clinical={df.Clinical_Source.ne("").sum()}')
+
+combined = pd.concat(all_manifest, ignore_index=True)
+for i, s1 in enumerate(SPLITS):
+    for s2 in SPLITS[i+1:]:
+        overlap = set(combined.loc[combined.Split.eq(s1),'Lesion_ID']) & set(combined.loc[combined.Split.eq(s2),'Lesion_ID'])
+        if overlap:
+            raise RuntimeError(f'LEAKAGE: {s1} vs {s2} share lesion IDs: {sorted(overlap)[:10]}')
+
+# --------------------- Optional full dermoscopic mask use ---------------------
+full_mask_csv = SEG / 'Reports' / 'Derm7pt_Mask_Manifest.csv'
+if USE_LESION_FOCUSED_DERMOSCOPY and full_mask_csv.is_file():
+    seg = pd.read_csv(full_mask_csv, dtype=str)
+    keys = [find_col(seg, ('Lesion_ID',)),find_col(seg,('Split',)),find_col(seg,('Predicted_Mask_Path',))]
+    if all(k is not None for k in keys):
+        segment = seg[keys].copy()
+        segment.columns=['Lesion_ID','Split','Dermoscopic_Mask']
+        segment['Lesion_ID']=segment['Lesion_ID'].map(clean_id)
+        segment['Split']=segment['Split'].astype(str).str.title()
+        if segment.duplicated(['Split','Lesion_ID']).any():
+            raise ValueError('Duplicate split and lesion ID in segmentation manifest.')
+        combined=combined.merge(segment,how='left',on=['Split','Lesion_ID'],validate='one_to_one')
+    else:
+        warnings.warn('Segmentation manifest missing keys; extracting from original dermoscopic images.')
+if 'Dermoscopic_Mask' not in combined:
+    combined['Dermoscopic_Mask']=''
+
+# The clinical 15-image quick test must NOT be used as if it covers the full clinical dataset.
+if USE_LESION_FOCUSED_CLINICAL:
+    raise ValueError('Full-dataset validated clinical masks are not configured. Set USE_LESION_FOCUSED_CLINICAL=False.')
+
+combined['Dermoscopic_Mask'] = combined['Dermoscopic_Mask'].fillna('')
+combined['Has_Dermoscopic'] = combined['Dermoscopic_Source'].ne('')
+combined['Has_Clinical'] = combined['Clinical_Source'].ne('')
+combined.to_csv(REPORT / 'Step4_Original_Split_Audit.csv', index=False)
+
+# --------------------- Torch dataset ---------------------
+# Use ImageNet normalization for TIMM pretrained encoders.
+mean = np.asarray((0.485,0.456,0.406), dtype=np.float32)
+std = np.asarray((0.229,0.224,0.225), dtype=np.float32)
+
+class LesionImageDataset(Dataset):
+    def __init__(self, table, column, modality):
+        self.table=table.reset_index(drop=True)
+        self.column=column
+        self.modality=modality
+    def __len__(self):
+        return len(self.table)
+    def __getitem__(self, index):
+        row=self.table.iloc[index]
+        try:
+            path=Path(row[self.column])
+            with Image.open(path) as img:
+                img=ImageOps.exif_transpose(img).convert('RGB')
+                img=img.resize((IMG_SIZE,IMG_SIZE),Image.Resampling.BICUBIC)
+                arr=np.asarray(img,dtype=np.float32)/255.
+            if self.modality=='derm' and USE_LESION_FOCUSED_DERMOSCOPY:
+                mask_path=resolve_saved_path(row['Dermoscopic_Mask'])
+                if mask_path is not None:
+                    with Image.open(mask_path) as mask:
+                        m=mask.convert('L').resize((IMG_SIZE,IMG_SIZE),Image.Resampling.NEAREST)
+                        mask_array=np.asarray(m,dtype=np.uint8)>=128
+                    # Do not use degenerate all-black/all-white predicted masks.
+                    if mask_array.any() and not mask_array.all():
+                        arr=arr*mask_array[:,:,None]
+            tensor=torch.from_numpy(((arr-mean)/std).transpose(2,0,1).copy())
+            return tensor, index, ''
+        except Exception as ex:
+            return torch.zeros((3,IMG_SIZE,IMG_SIZE),dtype=torch.float32), index, str(ex)[:160]
+
+# --------------------- Feature encoder ---------------------
+def make_model(name):
+    print('Loading ImageNet pretrained:',name)
+    net = timm.create_model(name, pretrained=True, num_classes=0, global_pool='avg')
+    net=net.to(device)
+    net.eval()
+    for par in net.parameters():
+        par.requires_grad_(False)
+    return net
+
+@torch.inference_mode()
+def encode_one(model_name, valid_table, modality, image_col, split):
+    # One backbone at a time reduces GPU memory.
+    model=make_model(model_name)
+    dim=int(model.num_features)
+    unique = re.sub(r'[^A-Za-z0-9_.-]','_',model_name)
+    folder=RAW / split / modality
+    folder.mkdir(parents=True,exist_ok=True)
+    npy_path=folder/f'{unique}.npy'
+    ids_path=folder/f'{unique}_ids.csv'
+    err_path=folder/f'{unique}_errors.csv'
+    table_ids=valid_table['Lesion_ID'].astype(str).tolist()
+    if not OVERWRITE_EXISTING_FEATURES and npy_path.is_file() and ids_path.is_file():
+        existing=pd.read_csv(ids_path,dtype=str)['Lesion_ID'].tolist()
+        if existing==table_ids:
+            cached=np.load(npy_path,mmap_mode='r')
+            if cached.shape==(len(table_ids),dim):
+                print(f'Reusing saved {split}/{modality}/{model_name}: {cached.shape}')
+                del model
+                if device.type=='cuda': torch.cuda.empty_cache()
+                return np.asarray(cached).copy(),pd.read_csv(err_path) if err_path.exists() else pd.DataFrame(columns=['Index','Error'])
+
+    features=np.full((len(valid_table),dim),np.nan,dtype=np.float32)
+    problems=[]
+    dataset=LesionImageDataset(valid_table,image_col,modality)
+    loader=DataLoader(dataset,batch_size=BATCH_SIZE,shuffle=False,
+                      num_workers=NUM_WORKERS,pin_memory=(device.type=='cuda'))
+    for images, indices, errors in tqdm(loader,desc=f'{split} {modality}: {model_name}'):
+        idx=np.asarray(indices)
+        good=np.asarray([not bool(e) for e in errors],dtype=bool)
+        for i,err in enumerate(errors):
+            if err: problems.append({'Index':int(idx[i]),'Error':err})
+        if not good.any():continue
+        batch=images[good].to(device,non_blocking=True)
+        with torch.autocast(device_type='cuda',dtype=torch.float16,
+                            enabled=(USE_AMP and device.type=='cuda')):
+            z=model(batch)
+        z=z.detach().float().cpu().numpy()
+        if z.ndim != 2 or z.shape[1] != dim:
+            raise RuntimeError(f'{model_name}: expected (N,{dim}) got {z.shape}')
+        features[idx[good]]=z
+    np.save(npy_path,features)
+    pd.DataFrame({'Lesion_ID':table_ids}).to_csv(ids_path,index=False)
+    pd.DataFrame(problems,columns=['Index','Error']).to_csv(err_path,index=False)
+    del model,loader,dataset
+    gc.collect()
+    if device.type=='cuda':torch.cuda.empty_cache()
+    return features,pd.DataFrame(problems)
+
+# --------------------- Full image feature extraction ---------------------
+feature_paths={}
+report={'device':str(device),'image_size':IMG_SIZE,'batch_size':BATCH_SIZE,
+        'models':{'dermoscopic':list(DERM_MODELS),'clinical':list(CLIN_MODELS)},
+        'pipeline_type':'Frozen pretrained backbone feature concatenation; not exact learned paper hybrids',
+        'splits':{}}
+
+for split in SPLITS:
+    sframe=combined.loc[combined.Split.eq(split)].copy().reset_index(drop=True)
+    split_report={'manifest_rows':int(len(sframe)),'branches':{}}
+    for modality,source_col,model_list,output_tag in (
+        ('derm','Dermoscopic_Source',DERM_MODELS,'ViT_Swin_Dermoscopic'),
+        ('clinical','Clinical_Source',CLIN_MODELS,'ConvNeXt_ViT_Clinical')):
+        valid=sframe.loc[sframe[source_col].ne('')].copy().reset_index(drop=True)
+        parts=[]; errors_total=[]
+        for name in model_list:
+            if len(valid):
+                block,errs=encode_one(name,valid,modality,source_col,split)
+            else:
+                # still verify dimensionality without requiring image inference
+                net=make_model(name)
+                dim=int(net.num_features)
+                del net
+                if device.type=='cuda':torch.cuda.empty_cache()
+                block=np.empty((0,dim),dtype=np.float32)
+                errs=pd.DataFrame(columns=['Index','Error'])
+            parts.append((name,block))
+            if len(errs):errors_total.append(errs.assign(Model=name))
+        matrix=np.concatenate([b for _,b in parts],axis=1)
+        feature_cols=[f'{modality}_{re.sub("[^A-Za-z0-9]","_",name)}_{j:04d}'
+                      for name,b in parts for j in range(b.shape[1])]
+        out_df=pd.DataFrame(matrix,columns=feature_cols)
+        out_df.insert(0,'Lesion_ID',valid.Lesion_ID.to_numpy())
+        file=OUT/f'{split}_{output_tag}_Features.csv'
+        if EXPORT_PER_SPLIT_CSV:out_df.to_csv(file,index=False)
+        # Also save compressed float32 features
+        np.savez_compressed(OUT/f'{split}_{output_tag}_Features.npz',
+                            X=matrix,Lesion_ID=valid.Lesion_ID.to_numpy(dtype=str))
+        feature_paths[(split,modality)]=file
+        split_report['branches'][modality]={
+            'available_images':int(len(valid)),
+            'feature_dimensions':int(matrix.shape[1]),
+            'records_with_any_nonfinite_feature':int((~np.isfinite(matrix)).any(axis=1).sum()) if len(matrix) else 0,
+            'individual_models':{name:int(b.shape[1]) for name,b in parts},
+            'file':str(file)}
+        if errors_total:
+            pd.concat(errors_total,ignore_index=True).to_csv(
+                REPORT/f'{split}_{modality}_Read_Errors.csv',index=False)
+        print(f'{split} {output_tag}: {matrix.shape}')
+    report['splits'][split]=split_report
+
+# --------------------- FT-Transformer metadata embeddings ---------------------
+# Metadata embeddings are loaded, never invented or re-trained in this script.
+META_ROOT=PREP/'13_FTTransformer_Metadata'
+META_CANDIDATES=(
+    '{split}_Metadata_Embeddings.csv',
+    '{split}_FTTransformer_Metadata_Embeddings.csv',
+    '{split}_FTTransformer_Embeddings.csv',
+)
+meta_tables=[]
+for split in SPLITS:
+    candidates=[META_ROOT/p.format(split=split) for p in META_CANDIDATES]
+    existing=next((p for p in candidates if p.is_file()),None)
+    if existing is None:
+        warnings.warn(f'{split} FT-Transformer embedding CSV not found in {META_ROOT}')
+        report['splits'][split]['metadata']={'status':'MISSING','expected_folder':str(META_ROOT)}
+        continue
+    meta=pd.read_csv(existing)
+    id_col=find_col(meta,('Lesion_ID','lesion_id','case_num','Case_ID'))
+    if id_col is None:
+        raise ValueError(f'{existing.name}: no Lesion_ID column. Do NOT align by row order.')
+    meta['Lesion_ID']=meta[id_col].map(clean_id)
+    if meta.Lesion_ID.duplicated().any():
+        raise ValueError(f'{existing.name}: duplicate lesion IDs in metadata embeddings')
+    ignore={id_col,'Lesion_ID','Split','Diagnosis','Diagnosis_Code','Original_Row','Is_Augmented'}
+    numeric=[]
+    for c in meta.columns:
+        if c in ignore:continue
+        values=pd.to_numeric(meta[c],errors='coerce')
+        if values.notna().any():
+            meta[c]=values
+            numeric.append(c)
+    if not numeric:raise ValueError(f'{existing.name}: no numerical metadata embeddings')
+    out=meta[['Lesion_ID']+numeric].copy()
+    out=out.rename(columns={c:f'meta_{str(c)}' for c in numeric})
+    ordered=combined.loc[combined.Split.eq(split),['Lesion_ID']].copy()
+    out=ordered.merge(out,on='Lesion_ID',how='left',validate='one_to_one')
+    out_file=OUT/f'{split}_FTTransformer_Aligned_Metadata_Embeddings.csv'
+    out.to_csv(out_file,index=False)
+    found=int(out.iloc[:,1:].notna().any(axis=1).sum())
+    report['splits'][split]['metadata']={
+        'status':'FOUND','source':str(existing),'feature_dimensions':len(numeric),
+        'matched_records':found,'missing_records':int(len(out)-found),
+        'file':str(out_file)}
+    meta_tables.append(out)
+    print(f'{split} metadata: {found}/{len(out)} matched; dim={len(numeric)}')
+
+# --------------------- Cross-branch identity audit ---------------------
+match_rows=[]
+for split in SPLITS:
+    df=combined.loc[combined.Split.eq(split),['Split','Lesion_ID','Has_Dermoscopic','Has_Clinical']].copy()
+    meta_file=OUT/f'{split}_FTTransformer_Aligned_Metadata_Embeddings.csv'
+    if meta_file.is_file():
+        md=pd.read_csv(meta_file,dtype={'Lesion_ID':str})
+        md['Lesion_ID']=md.Lesion_ID.map(clean_id)
+        meta_ok=set(md.loc[md.iloc[:,1:].notna().any(axis=1),'Lesion_ID'])
+    else:
+        meta_ok=set()
+    df['Has_Metadata_Embedding']=df.Lesion_ID.isin(meta_ok)
+    df['All_Three_Modalities']=df[['Has_Dermoscopic','Has_Clinical','Has_Metadata_Embedding']].all(axis=1)
+    match_rows.append(df)
+audit=pd.concat(match_rows,ignore_index=True)
+audit.to_csv(REPORT/'Step4_Multimodal_Availability_Audit.csv',index=False)
+
+# --------------------- Summary visualization ---------------------
+fig,ax=plt.subplots(figsize=(9,4.5))
+labels=list(SPLITS)
+indices=np.arange(len(labels))
+for i,col in enumerate(('Has_Dermoscopic','Has_Clinical','Has_Metadata_Embedding','All_Three_Modalities')):
+    values=[int(audit.loc[audit.Split.eq(s),col].sum()) for s in labels]
+    ax.bar(indices+(i-1.5)*0.19,values,width=0.19,label=col.replace('_',' '))
+ax.set_xticks(indices,labels)
+ax.set_ylabel('Lesions')
+ax.set_title('Full Derm7pt: Available Modalities by Split')
+ax.legend(fontsize=8,ncol=2)
+fig.tight_layout()
+fig.savefig(VIS/'Step4_Modality_Coverage.png',dpi=150)
+plt.show()
+plt.close(fig)
+
+report['all_three_modality_records']=int(audit.All_Three_Modalities.sum())
+report['total_manifest_records']=int(len(audit))
+report['notes']=[
+    'Frozen ImageNet feature extractors: no Derm7pt task-specific fine-tuning.',
+    'ViT+Swin and ConvNeXt+ViT are independent backbone feature concatenations, not exact custom hybrids.',
+    'For PDF-exact results, train the specified architectures and 256-D projection heads on training only.',
+    'Clinical features use original photos unless appropriately validated full clinical masks are available.',
+    'Do not interpret feature dimensions or model availability as classification accuracy.',
+    'Metadata feature embeddings must have been fitted with train-only protocol to avoid leakage.',
+    'Raw feature CSVs include only rows for images actually available; join downstream using Lesion_ID.'
+]
+with open(REPORT/'Step4_Full_Feature_Extraction_Summary.json','w') as f:
+    json.dump(report,f,indent=2)
+
+print('\n'+'='*70)
+print('STEP 4: FULL-DATASET FEATURE EXTRACTION FINISHED')
+print('='*70)
+print('Manifest records:',len(audit))
+print('Complete three-modality records:',int(audit.All_Three_Modalities.sum()))
+print('Feature files:',OUT)
+print('Audit:',REPORT/'Step4_Multimodal_Availability_Audit.csv')
+print('Summary:',REPORT/'Step4_Full_Feature_Extraction_Summary.json')
+print('NEXT: Train three 256-D projections on TRAIN only and fuse 768-D for HH-SNN.')

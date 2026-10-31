@@ -1,0 +1,359 @@
+# ================================================================
+# DERM7PT STEP 6 — FULL-DATA 5-CLASS HH-DYNAMICS-INSPIRED SNN
+# Input: Step5_Full_768D_Learned_Fusion/{Train,Validation,Test}_Fused_768D.csv
+# Train only on Train; Validation for early stopping; Test for final reporting.
+# 256 conductance-based neurons; 20 numerical membrane steps; PyTorch.
+# This is a differentiable HH-inspired approximation, NOT a reproduction
+# of a validated precise biological HH spike simulator or paper HH-SNN.
+# ================================================================
+# Google Colab: %pip -q install torch pandas numpy scikit-learn matplotlib joblib
+import os, re, json, copy, random, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (accuracy_score, precision_recall_fscore_support,
+    balanced_accuracy_score, confusion_matrix, classification_report,
+    roc_auc_score, roc_curve, auc)
+import joblib
+
+SEED = 42
+EPOCHS = 80
+PATIENCE = 12
+BATCH_SIZE = 32
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
+N_HH_NEURONS = 256
+TIME_STEPS = 20
+DT_MS = 0.05
+DROPOUT = 0.2
+SPLITS = ('Train', 'Validation', 'Test')
+CLASSES = ('Nevus', 'Melanoma', 'MISC', 'SK', 'BCC')
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Device:', DEVICE)
+
+# --------------------- Google Drive ------------------------------
+def find_project():
+    for mount in (Path('/content/drive'), Path('/content/gdrive')):
+        p = mount / 'MyDrive' / 'Derm7pt'
+        if p.is_dir(): return p
+    try:
+        from google.colab import drive
+    except ImportError:
+        raise FileNotFoundError('Run in Colab with your Google Drive mounted.')
+    for mount in (Path('/content/drive'), Path('/content/gdrive')):
+        mount.mkdir(parents=True, exist_ok=True)
+        if not os.path.ismount(str(mount)) and not any(mount.iterdir()):
+            drive.mount(str(mount), force_remount=False)
+        p = mount / 'MyDrive' / 'Derm7pt'
+        if p.is_dir(): return p
+    raise FileNotFoundError('Could not locate MyDrive/Derm7pt; mount Drive first.')
+
+BASE = find_project()
+PREP = BASE / 'Derm7pt_Preprocessed'
+IN_DIR = PREP / 'Step5_Full_768D_Learned_Fusion'
+OUT = PREP / 'Step6_Full_FiveClass_HHSNN'
+MODEL_DIR = OUT / 'Models'; REPORT_DIR = OUT / 'Reports'; VIS_DIR = OUT / 'Visualizations'
+for d in (MODEL_DIR, REPORT_DIR, VIS_DIR): d.mkdir(parents=True, exist_ok=True)
+
+# --------------------- Read and audit Step 5 files ---------------
+feature_cols = [f'Fusion_{i:03d}' for i in range(768)]
+frames = {}; data = {}; ids_by_split = {}
+for split in SPLITS:
+    p = IN_DIR / f'{split}_Fused_768D.csv'
+    if not p.is_file():
+        raise FileNotFoundError(f'Missing Step 5 full fusion output: {p}\nRun FULL Step 5 first; do not use 15-image quick files.')
+    df = pd.read_csv(p, dtype={'Lesion_ID': str}, low_memory=False)
+    required = {'Lesion_ID', 'Diagnosis', 'Split', *feature_cols}
+    missing = required - set(df.columns)
+    if missing: raise ValueError(f'{p.name} missing columns: {sorted(missing)[:15]}')
+    if len(df) == 0: raise ValueError(f'{split}: empty fused file')
+    df['Lesion_ID'] = df['Lesion_ID'].astype(str).str.strip().str.replace(r'(?<=\d)\.0$', '', regex=True)
+    if df['Lesion_ID'].eq('').any() or df['Lesion_ID'].duplicated().any():
+        raise ValueError(f'{split}: empty or duplicated lesion IDs')
+    if not df['Split'].astype(str).eq(split).all():
+        raise ValueError(f'{split}: Split column disagrees with its filename')
+    if df['Diagnosis'].isna().any(): raise ValueError(f'{split}: missing labels')
+    unknown = set(df['Diagnosis'].astype(str)) - set(CLASSES)
+    if unknown: raise ValueError(f'{split}: unknown diagnoses {sorted(unknown)}')
+    x = df[feature_cols].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=np.float32)
+    if x.shape[1] != 768 or not np.isfinite(x).all():
+        raise ValueError(f'{split}: expected 768 finite fusion features per sample')
+    y = df['Diagnosis'].astype(str).map({c: i for i, c in enumerate(CLASSES)}).to_numpy(dtype=np.int64)
+    frames[split] = df[['Lesion_ID', 'Diagnosis', 'Split']].copy()
+    data[split] = {'X': x, 'y': y}
+    ids_by_split[split] = set(df['Lesion_ID'])
+    print(f'{split}: {x.shape}; class counts {df.Diagnosis.value_counts().to_dict()}')
+for i, a in enumerate(SPLITS):
+    for b in SPLITS[i+1:]:
+        intersection = ids_by_split[a] & ids_by_split[b]
+        if intersection: raise ValueError(f'LEAKAGE: {a}/{b} share lesion IDs {sorted(intersection)[:10]}')
+missing_train = set(CLASSES) - set(frames['Train']['Diagnosis'])
+if missing_train:
+    raise ValueError(f'TRAIN missing {sorted(missing_train)}. Need full Step5 and all five classes; will not silently exclude evaluation records.')
+if min(len(data[s]['y']) for s in SPLITS) < 2:
+    raise ValueError('Validation and Test should each contain at least two records.')
+
+# Fit standardization using TRAIN ONLY. Step 5 already standardized source
+# branches; its 768-D output is restandardized for stable HH input currents.
+scaler = StandardScaler()
+data['Train']['X'] = scaler.fit_transform(data['Train']['X']).astype(np.float32)
+for split in ('Validation', 'Test'):
+    data[split]['X'] = scaler.transform(data[split]['X']).astype(np.float32)
+for split in SPLITS:
+    if not np.isfinite(data[split]['X']).all(): raise ValueError(f'{split}: nonfinite scaled data')
+joblib.dump({'scaler': scaler, 'classes': CLASSES, 'columns': feature_cols}, MODEL_DIR / 'HH_TrainOnly_Scaler.joblib')
+
+# --------------------- Differentiable HH-inspired membrane -------
+class HHMembrane(nn.Module):
+    """Conductance-based HH-style updates for m/h/n gating and voltage.
+
+    Uses Euler integration over TIME_STEPS and differentiable voltage/spike
+    summaries rather than hard, non-differentiable threshold spike events.
+    This is an HH-dynamics-inspired approximation for classification.
+    """
+    def __init__(self, steps=20, dt=0.05):
+        super().__init__()
+        self.steps, self.dt = int(steps), float(dt)
+        self.g_na, self.g_k, self.g_l = 120.0, 36.0, 0.3
+        self.e_na, self.e_k, self.e_l = 50.0, -77.0, -54.387
+
+    @staticmethod
+    def vtrap(x, scale):
+        # Numerically stable x/(1-exp(-x/scale)) near x=0.
+        z = (x / scale).clamp(-30, 30)
+        denominator = torch.where(torch.abs(z) < 1e-4,
+                                  torch.ones_like(z), -torch.expm1(-z))
+        return torch.where(torch.abs(z) < 1e-4,
+                           scale * (1 + z/2 + z*z/12), x / denominator)
+
+    def forward(self, current):
+        v = torch.full_like(current, -65.0)
+        m = torch.full_like(current, 0.0529)
+        h = torch.full_like(current, 0.5961)
+        n = torch.full_like(current, 0.3177)
+        voltage_integral = torch.zeros_like(current)
+        spike_proxy = torch.zeros_like(current)
+        for _ in range(self.steps):
+            am = 0.1 * self.vtrap(v + 40.0, 10.0)
+            bm = 4.0 * torch.exp((-(v + 65.0) / 18.0).clamp(-30, 30))
+            ah = 0.07 * torch.exp((-(v + 65.0) / 20.0).clamp(-30, 30))
+            bh = torch.sigmoid((v + 35.0) / 10.0)
+            an = 0.01 * self.vtrap(v + 55.0, 10.0)
+            bn = 0.125 * torch.exp((-(v + 65.0) / 80.0).clamp(-30, 30))
+            m = torch.clamp(m + self.dt * (am * (1 - m) - bm * m), 0, 1)
+            h = torch.clamp(h + self.dt * (ah * (1 - h) - bh * h), 0, 1)
+            n = torch.clamp(n + self.dt * (an * (1 - n) - bn * n), 0, 1)
+            ion_na = self.g_na * (m ** 3) * h * (v - self.e_na)
+            ion_k = self.g_k * (n ** 4) * (v - self.e_k)
+            ion_l = self.g_l * (v - self.e_l)
+            v = torch.clamp(v + self.dt * (current - ion_na - ion_k - ion_l), -100, 80)
+            voltage_integral = voltage_integral + (v + 65.0) / 100.0
+            spike_proxy = spike_proxy + torch.sigmoid((v + 20.0) / 5.0)
+        # Surrogate spike activation and membrane voltage feature.
+        return torch.cat([voltage_integral / self.steps, spike_proxy / self.steps], dim=1)
+
+class HHDynamicsClassifier(nn.Module):
+    def __init__(self, in_dim=768, neurons=256, n_classes=5):
+        super().__init__()
+        self.input_projection = nn.Linear(in_dim, neurons)
+        self.membrane = HHMembrane(steps=TIME_STEPS, dt=DT_MS)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(neurons * 2),
+            nn.Linear(neurons * 2, 128), nn.GELU(),
+            nn.Dropout(DROPOUT), nn.Linear(128, n_classes)
+        )
+    def forward(self, x):
+        # Bounded stimulus current; range permits membrane response.
+        current = 12.0 + 18.0 * torch.tanh(self.input_projection(x))
+        state = self.membrane(current)
+        return self.classifier(state)
+
+model = HHDynamicsClassifier(n_classes=len(CLASSES)).to(DEVICE)
+print('\nModel:', model)
+print('Trainable parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+# --------------------- Train -------------------------------------
+def loader(split, shuffle=False):
+    obj = data[split]
+    ds = TensorDataset(torch.tensor(obj['X']), torch.tensor(obj['y']))
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle, num_workers=0)
+train_loader = loader('Train', shuffle=True)
+val_loader = loader('Validation')
+train_count = np.bincount(data['Train']['y'], minlength=len(CLASSES))
+class_weights = len(data['Train']['y']) / (len(CLASSES) * train_count)
+criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=DEVICE))
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4)
+
+def one_epoch(dataloader, train=False):
+    model.train(train)
+    total_loss, predictions, truths, total = 0., [], [], 0
+    for x, y in dataloader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        if train: optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(train):
+            logits = model(x)
+            loss = criterion(logits, y)
+            if train:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                optimizer.step()
+        total_loss += float(loss.item()) * len(y)
+        predictions.extend(logits.argmax(dim=1).detach().cpu().numpy().tolist())
+        truths.extend(y.detach().cpu().numpy().tolist())
+        total += len(y)
+    return total_loss / max(total, 1), accuracy_score(truths, predictions)
+
+log = []; best_val, best_epoch, stagnant = float('inf'), 0, 0
+checkpoint = MODEL_DIR / 'Best_HH_Dynamics_Classifier.pt'
+for epoch in range(1, EPOCHS + 1):
+    train_loss, train_acc = one_epoch(train_loader, train=True)
+    val_loss, val_acc = one_epoch(val_loader, train=False)
+    if not all(np.isfinite(v) for v in (train_loss, train_acc, val_loss, val_acc)):
+        raise RuntimeError('Non-finite training metrics. Inspect input data or lower LEARNING_RATE.')
+    log.append({'epoch': epoch, 'loss': train_loss, 'accuracy': train_acc,
+                'val_loss': val_loss, 'val_accuracy': val_acc,
+                'learning_rate': optimizer.param_groups[0]['lr']})
+    scheduler.step(val_loss)
+    print(f'Epoch {epoch:03d} | loss={train_loss:.4f} acc={train_acc:.4f} | '
+          f'val_loss={val_loss:.4f} val_acc={val_acc:.4f}')
+    if val_loss < best_val - 1e-5:
+        best_val, best_epoch, stagnant = val_loss, epoch, 0
+        torch.save({'state_dict': copy.deepcopy(model.state_dict()), 'classes': CLASSES,
+                    'input_dim': 768, 'neurons': N_HH_NEURONS, 'time_steps': TIME_STEPS,
+                    'dt_ms': DT_MS, 'seed': SEED}, checkpoint)
+    else:
+        stagnant += 1
+        if stagnant >= PATIENCE:
+            print('Early stopping at epoch', epoch)
+            break
+pd.DataFrame(log).to_csv(REPORT_DIR / 'HH_Training_Log.csv', index=False)
+try:
+    saved = torch.load(checkpoint, map_location=DEVICE, weights_only=True)
+except TypeError:
+    saved = torch.load(checkpoint, map_location=DEVICE)
+model.load_state_dict(saved['state_dict'])
+model.eval()
+
+# --------------------- Predict and evaluate ----------------------
+@torch.no_grad()
+def predict(split):
+    probabilities = []
+    for x, _ in loader(split):
+        probabilities.append(torch.softmax(model(x.to(DEVICE)), dim=1).cpu().numpy())
+    return np.concatenate(probabilities, axis=0)
+
+all_metrics = []
+all_roc = {}
+for split in SPLITS:
+    probs = predict(split)
+    yt = data[split]['y']
+    yp = probs.argmax(axis=1)
+    frame = frames[split].copy()
+    frame['Predicted_Diagnosis'] = [CLASSES[i] for i in yp]
+    frame['Correct'] = yt == yp
+    for j, c in enumerate(CLASSES):
+        frame[f'Probability_{c}'] = probs[:, j]
+    frame.to_csv(REPORT_DIR / f'{split}_Predictions.csv', index=False)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        yt, yp, labels=np.arange(len(CLASSES)), zero_division=0)
+    per_class = pd.DataFrame({'Class': CLASSES, 'Support': support,
+                              'Precision': precision, 'Recall_Sensitivity': recall, 'F1': f1})
+    cm = confusion_matrix(yt, yp, labels=np.arange(len(CLASSES)))
+    per_class['Specificity'] = [(cm.sum() - cm[j,:].sum() - cm[:,j].sum() + cm[j,j]) /
+        max(cm.sum() - cm[j,:].sum() - cm[:,j].sum() + cm[j,j] + cm[:,j].sum() - cm[j,j], 1)
+        for j in range(len(CLASSES))]
+    per_class.to_csv(REPORT_DIR / f'{split}_Per_Class_Metrics.csv', index=False)
+    macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+        yt, yp, labels=np.arange(len(CLASSES)), average='macro', zero_division=0)
+    present = np.unique(yt)
+    balanced = balanced_accuracy_score(yt, yp)
+    # AUC is only calculated for classes with positives AND negatives.
+    aucs = {}
+    for j, c in enumerate(CLASSES):
+        truth = (yt == j).astype(int)
+        if len(np.unique(truth)) == 2:
+            aucs[c] = float(roc_auc_score(truth, probs[:, j]))
+        else:
+            aucs[c] = None
+    if all(value is not None for value in aucs.values()):
+        macro_auc = float(np.mean(list(aucs.values())))
+    else:
+        macro_auc = None
+    metrics = {'Split': split, 'Samples': len(yt), 'Classes_in_truth': len(present),
+               'Accuracy': float(accuracy_score(yt, yp)), 'Balanced_Accuracy': float(balanced),
+               'Macro_Precision_5class': float(macro_p), 'Macro_Recall_5class': float(macro_r),
+               'Macro_F1_5class': float(macro_f1), 'Macro_OVR_ROC_AUC': macro_auc}
+    all_metrics.append(metrics)
+    print(split, metrics)
+    print(classification_report(yt, yp, labels=np.arange(len(CLASSES)),
+          target_names=CLASSES, zero_division=0))
+    np.save(REPORT_DIR / f'{split}_Confusion_Matrix.npy', cm)
+    if split == 'Test':
+        fig, ax = plt.subplots(figsize=(7, 6))
+        heat = ax.imshow(cm, cmap='Blues')
+        ax.set_xticks(range(len(CLASSES)), CLASSES, rotation=30, ha='right')
+        ax.set_yticks(range(len(CLASSES)), CLASSES)
+        ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+        ax.set_title('Five-Class Test Confusion Matrix')
+        for r in range(len(CLASSES)):
+            for c in range(len(CLASSES)):
+                ax.text(c, r, str(cm[r,c]), ha='center', va='center', fontsize=10)
+        fig.colorbar(heat, ax=ax); fig.tight_layout()
+        fig.savefig(VIS_DIR / 'Test_Confusion_Matrix.png', dpi=170)
+        plt.show(); plt.close(fig)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        n_curves = 0
+        for j, c in enumerate(CLASSES):
+            true_bin = (yt == j).astype(int)
+            if len(np.unique(true_bin)) < 2: continue
+            fpr, tpr, _ = roc_curve(true_bin, probs[:, j])
+            ax.plot(fpr, tpr, label=f'{c} (AUC={auc(fpr,tpr):.3f})')
+            n_curves += 1
+        ax.plot([0,1], [0,1], '--', color='gray', label='Chance')
+        ax.set(xlabel='False Positive Rate', ylabel='True Positive Rate', title='Test ROC — One-vs-Rest')
+        if n_curves: ax.legend(fontsize=9)
+        else: ax.text(.1,.5,'No class has both positives and negatives',transform=ax.transAxes)
+        fig.tight_layout(); fig.savefig(VIS_DIR / 'Test_ROC_Curves.png', dpi=170)
+        plt.show(); plt.close(fig)
+    all_roc[split] = aucs
+
+pd.DataFrame(all_metrics).to_csv(REPORT_DIR / 'HH_Summary_Metrics.csv', index=False)
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+hist = pd.DataFrame(log)
+ax[0].plot(hist['epoch'], hist['loss'], label='Train')
+ax[0].plot(hist['epoch'], hist['val_loss'], label='Validation')
+ax[0].set(xlabel='Epoch', ylabel='Cross-entropy', title='HH-SNN Training Loss'); ax[0].legend()
+ax[1].plot(hist['epoch'], hist['accuracy'], label='Train')
+ax[1].plot(hist['epoch'], hist['val_accuracy'], label='Validation')
+ax[1].set(xlabel='Epoch', ylabel='Accuracy', title='HH-SNN Accuracy'); ax[1].legend()
+fig.tight_layout(); fig.savefig(VIS_DIR / 'HH_Training_Curves.png', dpi=170)
+plt.show(); plt.close(fig)
+
+summary = {'architecture': 'Differentiable Hodgkin-Huxley-dynamics-inspired classifier',
+           'exact_paper_replication': False,
+           'n_classes': 5, 'classes': list(CLASSES),
+           'hidden_neurons': N_HH_NEURONS, 'time_steps': TIME_STEPS,
+           'step_dt_ms': DT_MS, 'best_epoch': best_epoch, 'best_val_loss': best_val,
+           'train_only_scaling': True,
+           'train_validation_test_sizes': {s: len(data[s]['y']) for s in SPLITS},
+           'results': all_metrics, 'per_class_roc_auc': all_roc,
+           'limitations': [
+             'HH gate/voltage dynamics are differentiable and use a surrogate spiking summary, not hard biological spikes.',
+             'Full 5-class evaluation needs adequate labeled test examples for every class.',
+             'Source Step 4 encoders are pretrained frozen concatenations, not exact paper hybrid backbones.',
+             'Any cross-split ID leakage at patient-level must also be checked if patient identifiers exist.']}
+with open(REPORT_DIR / 'Step6_HH_SNN_Summary.json', 'w') as f:
+    json.dump(summary, f, indent=2)
+print('\nSTEP 6 FINISHED')
+print('Best epoch:', best_epoch)
+print('Saved model:', checkpoint)
+print('Predictions and metrics:', REPORT_DIR)
+print('Visualizations:', VIS_DIR)

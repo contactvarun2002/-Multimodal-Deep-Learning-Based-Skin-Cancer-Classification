@@ -1,0 +1,1359 @@
+# ================================================================
+# DERM7PT - COMPLETE CORRECTED MULTIMODAL PREPROCESSING
+# ================================================================
+# PROJECT:
+# Context-Aware Multimodal Skin Lesion Intelligence
+#
+# INPUT:
+# /content/drive/MyDrive/Derm7pt/release_v0/
+#     images/
+#     meta/
+#         meta.csv
+#         train_indexes.csv
+#         valid_indexes.csv
+#         test_indexes.csv
+#
+# OUTPUT:
+# /content/drive/MyDrive/Derm7pt/Derm7pt_Preprocessed/
+#
+# FIXES:
+# - processed DataFrame created explicitly
+# - Original_Row naming fixed
+# - robust split index loading
+# - lesion-level leakage prevention
+# - case_num excluded from predictive features
+# - no use of diagnosis-derived metadata as predictors
+# - training-only metadata fitting
+# - paired image preprocessing
+# - training-only augmentation
+# - output validation and visualization
+# ================================================================
+
+!pip -q install numpy pandas pillow matplotlib scikit-learn tqdm joblib
+
+import os
+import re
+import json
+import random
+import hashlib
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+
+from PIL import Image, ImageOps, ImageEnhance, ImageFile
+from tqdm.auto import tqdm
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from google.colab import drive
+
+warnings.filterwarnings("ignore")
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# ================================================================
+# STEP 1 - CONFIGURATION
+# ================================================================
+
+SEED = 42
+IMG_SIZE = (224, 224)
+AUGMENT_COPIES = 1
+
+# The project uses three aligned modalities.
+REQUIRE_BOTH_IMAGES = True
+
+# Use the five-class grouping specified in the concept.
+FIVE_CLASS_MODE = True
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+if not os.path.ismount("/content/drive"):
+    drive.mount("/content/drive")
+
+ROOT = Path("/content/drive/MyDrive/Derm7pt/release_v0")
+META_DIR = ROOT / "meta"
+IMAGE_DIR = ROOT / "images"
+
+OUTPUT = Path(
+    "/content/drive/MyDrive/Derm7pt/Derm7pt_Preprocessed"
+)
+
+DERM_OUT = OUTPUT / "Dermoscopic"
+CLINICAL_OUT = OUTPUT / "Clinical"
+MANIFEST_OUT = OUTPUT / "Manifests"
+META_OUT = OUTPUT / "Metadata"
+VIS_OUT = OUTPUT / "Visualizations"
+REPORT_OUT = OUTPUT / "Reports"
+
+for folder in [
+    DERM_OUT, CLINICAL_OUT, MANIFEST_OUT,
+    META_OUT, VIS_OUT, REPORT_OUT
+]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+assert META_DIR.is_dir(), f"Missing folder: {META_DIR}"
+assert IMAGE_DIR.is_dir(), f"Missing folder: {IMAGE_DIR}"
+assert (META_DIR / "meta.csv").is_file(), "meta.csv missing"
+
+print("=" * 75)
+print("DERM7PT - MULTIMODAL DATA PREPROCESSING")
+print("=" * 75)
+print("Dataset:", ROOT)
+print("Output:", OUTPUT)
+
+# ================================================================
+# STEP 2 - LOAD ORIGINAL METADATA
+# ================================================================
+
+meta = pd.read_csv(META_DIR / "meta.csv")
+
+# Preserve exact original row positions.
+meta["Original_Row"] = np.arange(len(meta), dtype=int)
+
+print("\nOriginal metadata shape:", meta.shape)
+print("\nColumns:")
+print(meta.columns.tolist())
+
+# ================================================================
+# STEP 3 - IDENTIFY REQUIRED COLUMNS
+# ================================================================
+
+def find_col(df, candidates, required=True):
+    lookup = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
+
+    for name in candidates:
+        if name.lower() in lookup:
+            return lookup[name.lower()]
+
+    if required:
+        raise ValueError(
+            f"Missing column. Tried: {candidates}\n"
+            f"Available: {df.columns.tolist()}"
+        )
+
+    return None
+
+DERM_COL = find_col(
+    meta,
+    ["derm", "dermoscopic_image", "dermoscopic"]
+)
+
+CLINICAL_COL = find_col(
+    meta,
+    ["clinic", "clinical_image", "clinical"]
+)
+
+DIAG_COL = find_col(
+    meta,
+    ["diagnosis", "diagnostic", "label"]
+)
+
+# case_num is typically a case identifier.
+ID_COL = find_col(
+    meta,
+    ["case_num", "case_id", "lesion_id", "patient_id"],
+    required=False
+)
+
+if ID_COL:
+    meta["Lesion_ID"] = meta[ID_COL].astype("string")
+else:
+    meta["Lesion_ID"] = meta["Original_Row"].astype("string")
+
+# Missing IDs are replaced by unique original-row IDs.
+missing_ids = (
+    meta["Lesion_ID"].isna() |
+    meta["Lesion_ID"].str.strip().eq("")
+)
+
+meta.loc[missing_ids, "Lesion_ID"] = (
+    "row_" +
+    meta.loc[missing_ids, "Original_Row"].astype(str)
+)
+
+meta["Lesion_ID"] = meta["Lesion_ID"].str.strip()
+
+# ================================================================
+# STEP 4 - RESOLVE IMAGE PATHS
+# ================================================================
+
+extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+image_files = [
+    p for p in IMAGE_DIR.rglob("*")
+    if p.is_file() and p.suffix.lower() in extensions
+]
+
+print("\nDiscovered image files:", len(image_files))
+
+name_lookup = {}
+stem_lookup = {}
+
+for p in image_files:
+    name_lookup.setdefault(p.name.lower(), []).append(p)
+    stem_lookup.setdefault(p.stem.lower(), []).append(p)
+
+def resolve_image(value):
+    if pd.isna(value):
+        return None
+
+    name = str(value).strip()
+
+    if not name or name.lower() in ("nan", "none"):
+        return None
+
+    p = Path(name)
+
+    candidates = [
+        p,
+        IMAGE_DIR / p,
+        ROOT / p
+    ]
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    matches = name_lookup.get(p.name.lower(), [])
+
+    if len(matches) == 1:
+        return str(matches[0])
+
+    matches = stem_lookup.get(p.stem.lower(), [])
+
+    if len(matches) == 1:
+        return str(matches[0])
+
+    return None
+
+meta["Dermoscopic_Original"] = (
+    meta[DERM_COL].apply(resolve_image)
+)
+
+meta["Clinical_Original"] = (
+    meta[CLINICAL_COL].apply(resolve_image)
+)
+
+meta["Has_Dermoscopic_Image"] = (
+    meta["Dermoscopic_Original"].notna()
+)
+
+meta["Has_Clinical_Image"] = (
+    meta["Clinical_Original"].notna()
+)
+
+print("\nImage availability:")
+print(pd.crosstab(
+    meta["Has_Dermoscopic_Image"],
+    meta["Has_Clinical_Image"]
+))
+
+# ================================================================
+# STEP 5 - LOAD ORIGINAL SPLIT INDICES
+# ================================================================
+# Supports:
+# - one-column CSV without a header
+# - one-column CSV with a header
+# - pandas-exported CSV with an unnamed index column
+#
+# Ambiguous formats are rejected rather than guessed.
+# ================================================================
+
+def load_indices(path, n_rows):
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    raw = pd.read_csv(path, header=None, dtype=str)
+
+    # Strip an optional header row.
+    first = str(raw.iloc[0, 0]).strip().lower()
+
+    if first in ("index", "indices", "idx", "row"):
+        raw = raw.iloc[1:].copy()
+
+    candidate_columns = []
+
+    for col in raw.columns:
+
+        numeric = pd.to_numeric(
+            raw[col], errors="coerce"
+        )
+
+        valid = numeric.dropna()
+
+        if valid.empty:
+            continue
+
+        if not np.all(
+            np.equal(valid, np.floor(valid))
+        ):
+            continue
+
+        valid = valid.astype(int)
+
+        if not valid.between(0, n_rows - 1).all():
+            continue
+
+        candidate_columns.append(
+            (col, valid.tolist())
+        )
+
+    if len(candidate_columns) == 0:
+        raise ValueError(
+            f"No valid row-index column in {path}"
+        )
+
+    if len(candidate_columns) == 1:
+        return candidate_columns[0][1]
+
+    # If multiple columns are present, a common export
+    # format is: exported row number + actual index.
+    # Prefer a column explicitly labeled as index.
+    with_header = pd.read_csv(path)
+
+    explicit = [
+        c for c in with_header.columns
+        if str(c).lower().strip() in (
+            "index", "indices", "idx", "row"
+        )
+    ]
+
+    if len(explicit) == 1:
+        values = pd.to_numeric(
+            with_header[explicit[0]],
+            errors="raise"
+        ).astype(int).tolist()
+
+        if all(0 <= x < n_rows for x in values):
+            return values
+
+    raise ValueError(
+        f"Ambiguous split-index CSV: {path}\n"
+        "Inspect its columns and specify which column "
+        "contains the original metadata row indices."
+    )
+
+split_files = {
+    "train": META_DIR / "train_indexes.csv",
+    "validation": META_DIR / "valid_indexes.csv",
+    "test": META_DIR / "test_indexes.csv"
+}
+
+split_indices = {
+    name: load_indices(path, len(meta))
+    for name, path in split_files.items()
+}
+
+for name, indices in split_indices.items():
+    if len(indices) != len(set(indices)):
+        raise ValueError(
+            f"Duplicate indices within {name} split"
+        )
+
+for a, b in [
+    ("train", "validation"),
+    ("train", "test"),
+    ("validation", "test")
+]:
+    overlap = (
+        set(split_indices[a]) &
+        set(split_indices[b])
+    )
+
+    if overlap:
+        raise ValueError(
+            f"Original row-index overlap: {a} / {b}: "
+            f"{len(overlap)}"
+        )
+
+meta["Split"] = "unassigned"
+
+for split, indices in split_indices.items():
+    meta.loc[
+        meta["Original_Row"].isin(indices),
+        "Split"
+    ] = split
+
+print("\nOriginal split counts:")
+print(meta["Split"].value_counts())
+
+# ================================================================
+# STEP 6 - DIAGNOSIS LABEL MAPPING
+# ================================================================
+
+def normalize_label(value):
+    if pd.isna(value):
+        return ""
+
+    text = str(value).lower().strip()
+    text = re.sub(r"[_\-/]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text
+
+meta["Diagnosis_Raw"] = meta[DIAG_COL]
+
+meta["Diagnosis_Normalized"] = (
+    meta[DIAG_COL].apply(normalize_label)
+)
+
+print("\nOriginal diagnosis categories:")
+print(meta["Diagnosis_Normalized"].value_counts())
+
+# Explicit five-class mapping.
+# These categories must be checked against meta.csv.
+LABEL_MAP = {
+    "nevus": 0,
+    "melanocytic nevus": 0,
+    "melanoma": 1,
+    "miscellaneous": 2,
+    "miscellaneous lesions": 2,
+    "seborrheic keratosis": 3,
+    "basal cell carcinoma": 4
+}
+
+CLASS_NAMES = {
+    0: "Nevus",
+    1: "Melanoma",
+    2: "Miscellaneous",
+    3: "Seborrheic Keratosis",
+    4: "Basal Cell Carcinoma"
+}
+
+meta["Diagnosis_Code"] = (
+    meta["Diagnosis_Normalized"].map(LABEL_MAP)
+)
+
+meta[
+    meta["Diagnosis_Code"].isna()
+].to_csv(
+    REPORT_OUT / "Unmapped_Diagnoses.csv",
+    index=False
+)
+
+meta = meta[
+    meta["Diagnosis_Code"].notna()
+].copy()
+
+meta["Diagnosis_Code"] = (
+    meta["Diagnosis_Code"].astype(int)
+)
+
+meta["Diagnosis"] = (
+    meta["Diagnosis_Code"].map(CLASS_NAMES)
+)
+
+# ================================================================
+# STEP 7 - FILTER MISSING IMAGE PAIRS
+# ================================================================
+
+before = len(meta)
+
+if REQUIRE_BOTH_IMAGES:
+    meta = meta[
+        meta["Has_Dermoscopic_Image"] &
+        meta["Has_Clinical_Image"]
+    ].copy()
+
+meta = meta[
+    meta["Split"].isin(
+        ["train", "validation", "test"]
+    )
+].copy()
+
+print("\nRows before pair filtering:", before)
+print("Rows after pair filtering:", len(meta))
+
+# ================================================================
+# STEP 8 - VALIDATE IMAGE FILES
+# ================================================================
+
+def valid_image(path):
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except Exception:
+        return False
+
+valid_pairs = []
+
+for row in tqdm(
+    meta.itertuples(index=False),
+    total=len(meta),
+    desc="Validating image pairs"
+):
+    valid_pairs.append(
+        valid_image(row.Dermoscopic_Original)
+        and valid_image(row.Clinical_Original)
+    )
+
+meta["Valid_Pair"] = valid_pairs
+
+meta[
+    ~meta["Valid_Pair"]
+].to_csv(
+    REPORT_OUT / "Invalid_Image_Pairs.csv",
+    index=False
+)
+
+meta = meta[
+    meta["Valid_Pair"]
+].copy()
+
+if meta.empty:
+    raise RuntimeError(
+        "No valid paired images remain."
+    )
+
+# ================================================================
+# STEP 9 - EXACT DUPLICATE PAIR DETECTION
+# ================================================================
+
+def md5_file(path):
+    digest = hashlib.md5()
+
+    with open(path, "rb") as f:
+        for chunk in iter(
+            lambda: f.read(1024 * 1024),
+            b""
+        ):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+meta["Derm_MD5"] = [
+    md5_file(p)
+    for p in tqdm(
+        meta["Dermoscopic_Original"],
+        desc="Hashing dermoscopic images"
+    )
+]
+
+meta["Clinical_MD5"] = [
+    md5_file(p)
+    for p in tqdm(
+        meta["Clinical_Original"],
+        desc="Hashing clinical images"
+    )
+]
+
+meta["Pair_Hash"] = (
+    meta["Derm_MD5"] + "|" +
+    meta["Clinical_MD5"]
+)
+
+# Check whether exact duplicates have conflicting labels.
+conflicting_hashes = (
+    meta.groupby("Pair_Hash")["Diagnosis_Code"]
+    .nunique()
+)
+
+conflicting_hashes = set(
+    conflicting_hashes[
+        conflicting_hashes > 1
+    ].index
+)
+
+if conflicting_hashes:
+    raise ValueError(
+        f"{len(conflicting_hashes)} exact image pairs "
+        "have conflicting diagnosis labels."
+    )
+
+# Keep the first occurrence of an exact duplicate pair.
+duplicates = meta.duplicated(
+    subset=["Pair_Hash"],
+    keep="first"
+)
+
+meta[duplicates].to_csv(
+    REPORT_OUT / "Duplicate_Image_Pairs.csv",
+    index=False
+)
+
+print("\nExact duplicate image pairs:", duplicates.sum())
+
+meta = meta[
+    ~duplicates
+].copy()
+
+# ================================================================
+# STEP 10 - RESOLVE LESION SPLIT OVERLAP
+# ================================================================
+# If the same lesion ID occurs across partitions,
+# assign all its remaining rows to the split in which
+# it first appeared, with train > validation > test.
+#
+# Save all changes for audit.
+# ================================================================
+
+priority = {
+    "train": 0,
+    "validation": 1,
+    "test": 2
+}
+
+meta["Split_Priority"] = (
+    meta["Split"].map(priority)
+)
+
+overlap_counts = (
+    meta.groupby("Lesion_ID")["Split"]
+    .nunique()
+)
+
+leaked_ids = overlap_counts[
+    overlap_counts > 1
+].index.tolist()
+
+print("\nOverlapping lesion IDs:", len(leaked_ids))
+
+if leaked_ids:
+    meta[
+        meta["Lesion_ID"].isin(leaked_ids)
+    ].to_csv(
+        REPORT_OUT / "Leakage_Before_Fix.csv",
+        index=False
+    )
+
+    chosen = (
+        meta.sort_values("Split_Priority")
+        .drop_duplicates("Lesion_ID")
+        .set_index("Lesion_ID")["Split"]
+        .to_dict()
+    )
+
+    meta["Split"] = (
+        meta["Lesion_ID"].map(chosen)
+    )
+
+meta = meta.drop(
+    columns=["Split_Priority"]
+)
+
+for a, b in [
+    ("train", "validation"),
+    ("train", "test"),
+    ("validation", "test")
+]:
+
+    ids_a = set(
+        meta.loc[
+            meta["Split"] == a,
+            "Lesion_ID"
+        ]
+    )
+
+    ids_b = set(
+        meta.loc[
+            meta["Split"] == b,
+            "Lesion_ID"
+        ]
+    )
+
+    overlap = ids_a & ids_b
+
+    if overlap:
+        raise RuntimeError(
+            f"Leakage remains between {a} and {b}"
+        )
+
+print("\nLeakage verification passed.")
+
+meta[
+    [
+        "Lesion_ID",
+        "Original_Row",
+        "Split",
+        "Diagnosis",
+        "Diagnosis_Code"
+    ]
+].to_csv(
+    REPORT_OUT / "Final_Split_Assignments.csv",
+    index=False
+)
+
+# ================================================================
+# STEP 11 - PREPROCESS AND SAVE IMAGE PAIRS
+# ================================================================
+
+def save_resized_rgb(source, destination):
+    with Image.open(source) as image:
+        image = ImageOps.exif_transpose(image)
+        image = image.convert("RGB")
+        image = image.resize(
+            IMG_SIZE,
+            Image.Resampling.LANCZOS
+        )
+        image.save(destination, format="PNG")
+
+processed_records = []
+
+for row in tqdm(
+    meta.itertuples(index=False),
+    total=len(meta),
+    desc="Resizing paired images"
+):
+
+    # Original_Row now works reliably.
+    uid = hashlib.sha1(
+        (
+            str(row.Lesion_ID) + "|" +
+            str(row.Original_Row)
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+
+    filename = f"lesion_{uid}.png"
+
+    class_folder = row.Diagnosis.replace(
+        " ", "_"
+    )
+
+    derm_folder = (
+        DERM_OUT / row.Split / class_folder
+    )
+
+    clinical_folder = (
+        CLINICAL_OUT / row.Split / class_folder
+    )
+
+    derm_folder.mkdir(
+        parents=True, exist_ok=True
+    )
+
+    clinical_folder.mkdir(
+        parents=True, exist_ok=True
+    )
+
+    derm_path = derm_folder / filename
+    clinical_path = clinical_folder / filename
+
+    save_resized_rgb(
+        row.Dermoscopic_Original,
+        derm_path
+    )
+
+    save_resized_rgb(
+        row.Clinical_Original,
+        clinical_path
+    )
+
+    processed_records.append({
+        "Lesion_ID": str(row.Lesion_ID),
+        "Original_Row": int(row.Original_Row),
+        "Split": row.Split,
+        "Diagnosis": row.Diagnosis,
+        "Diagnosis_Code": int(row.Diagnosis_Code),
+        "Dermoscopic_Image": str(derm_path),
+        "Clinical_Image": str(clinical_path),
+        "Is_Augmented": False
+    })
+
+# Explicitly create the variable before augmentation.
+processed = pd.DataFrame(processed_records)
+
+if processed.empty:
+    raise RuntimeError(
+        "No processed image pairs were created."
+    )
+
+print("\nProcessed DataFrame created successfully.")
+print("Shape:", processed.shape)
+print(processed.head())
+
+# ================================================================
+# STEP 12 - METADATA FEATURE SELECTION
+# ================================================================
+# Exclude identifiers and fields that may encode diagnosis
+# or clinical management decisions.
+#
+# seven_point_score is excluded by default because it is
+# derived from diagnostic criteria and can create an
+# overly optimistic evaluation in some study designs.
+# ================================================================
+
+EXCLUDE_METADATA = {
+    DERM_COL,
+    CLINICAL_COL,
+    DIAG_COL,
+    ID_COL,
+    "Original_Row",
+    "Lesion_ID",
+    "Split",
+    "Diagnosis",
+    "Diagnosis_Code",
+    "Diagnosis_Raw",
+    "Diagnosis_Normalized",
+    "Dermoscopic_Original",
+    "Clinical_Original",
+    "Has_Dermoscopic_Image",
+    "Has_Clinical_Image",
+    "Valid_Pair",
+    "Derm_MD5",
+    "Clinical_MD5",
+    "Pair_Hash",
+    "case_num",
+    "seven_point_score",
+    "management",
+    "notes"
+}
+
+metadata_columns = [
+    col for col in meta.columns
+    if col not in EXCLUDE_METADATA
+]
+
+numeric_cols = [
+    c for c in metadata_columns
+    if pd.api.types.is_numeric_dtype(meta[c])
+]
+
+categorical_cols = [
+    c for c in metadata_columns
+    if c not in numeric_cols
+]
+
+print("\nNumerical metadata:", numeric_cols)
+print("Categorical metadata:", categorical_cols)
+
+if not metadata_columns:
+    raise ValueError(
+        "No metadata predictors remain after exclusions."
+    )
+
+# ================================================================
+# STEP 13 - TRAIN-ONLY METADATA ENCODING
+# ================================================================
+
+numeric_pipeline = Pipeline([
+    (
+        "imputer",
+        SimpleImputer(strategy="median")
+    ),
+    (
+        "scaler",
+        StandardScaler()
+    )
+])
+
+categorical_pipeline = Pipeline([
+    (
+        "imputer",
+        SimpleImputer(
+            strategy="constant",
+            fill_value="Missing"
+        )
+    ),
+    (
+        "encoder",
+        OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False
+        )
+    )
+])
+
+transformers = []
+
+if numeric_cols:
+    transformers.append(
+        ("numeric", numeric_pipeline, numeric_cols)
+    )
+
+if categorical_cols:
+    transformers.append(
+        (
+            "categorical",
+            categorical_pipeline,
+            categorical_cols
+        )
+    )
+
+preprocessor = ColumnTransformer(
+    transformers=transformers,
+    remainder="drop",
+    verbose_feature_names_out=True
+)
+
+train_meta = meta[
+    meta["Split"] == "train"
+]
+
+if train_meta.empty:
+    raise RuntimeError(
+        "Training split is empty."
+    )
+
+preprocessor.fit(train_meta[metadata_columns])
+
+encoded_array = preprocessor.transform(
+    meta[metadata_columns]
+)
+
+feature_names = (
+    preprocessor.get_feature_names_out()
+)
+
+encoded_df = pd.DataFrame(
+    encoded_array,
+    columns=feature_names,
+    index=meta.index
+)
+
+encoded_df.insert(
+    0, "Lesion_ID",
+    meta["Lesion_ID"].astype(str)
+)
+
+encoded_df.insert(
+    1, "Original_Row",
+    meta["Original_Row"].astype(int)
+)
+
+encoded_df.insert(
+    2, "Split",
+    meta["Split"]
+)
+
+encoded_df.insert(
+    3, "Diagnosis_Code",
+    meta["Diagnosis_Code"].astype(int)
+)
+
+encoded_df.to_csv(
+    META_OUT / "Encoded_Metadata.csv",
+    index=False
+)
+
+joblib.dump(
+    preprocessor,
+    META_OUT / "Metadata_Preprocessor.joblib"
+)
+
+# Keep unencoded categorical features for FT-Transformer.
+raw_metadata = meta[
+    [
+        "Lesion_ID",
+        "Original_Row",
+        "Split",
+        "Diagnosis_Code"
+    ] + metadata_columns
+].copy()
+
+raw_metadata.to_csv(
+    META_OUT / "FTTransformer_Raw_Metadata.csv",
+    index=False
+)
+
+print("\nEncoded metadata dimension:",
+      encoded_array.shape[1])
+
+# ================================================================
+# STEP 14 - TRAINING-ONLY IMAGE AUGMENTATION
+# ================================================================
+
+def augment_pair(derm_path, clinical_path, seed):
+
+    rng = random.Random(seed)
+
+    with Image.open(derm_path) as img:
+        derm = img.convert("RGB").copy()
+
+    with Image.open(clinical_path) as img:
+        clinical = img.convert("RGB").copy()
+
+    angle = rng.choice([0, 90, 180, 270])
+    flip_h = rng.choice([True, False])
+    flip_v = rng.choice([True, False])
+
+    outputs = []
+
+    for image in [derm, clinical]:
+
+        if flip_h:
+            image = ImageOps.mirror(image)
+
+        if flip_v:
+            image = ImageOps.flip(image)
+
+        image = image.rotate(angle)
+
+        brightness = rng.uniform(0.90, 1.10)
+
+        image = ImageEnhance.Brightness(
+            image
+        ).enhance(brightness)
+
+        outputs.append(image)
+
+    return outputs
+
+augmented_records = []
+
+train_processed = processed[
+    processed["Split"] == "train"
+].copy()
+
+print("\nTraining samples before augmentation:",
+      len(train_processed))
+
+for row in tqdm(
+    train_processed.itertuples(index=False),
+    total=len(train_processed),
+    desc="Augmenting training image pairs"
+):
+
+    for copy_num in range(AUGMENT_COPIES):
+
+        seed_text = (
+            str(row.Lesion_ID) + "|" +
+            str(row.Original_Row) + "|" +
+            str(copy_num)
+        )
+
+        augmentation_seed = int(
+            hashlib.sha1(
+                seed_text.encode("utf-8")
+            ).hexdigest()[:8],
+            16
+        ) + SEED
+
+        derm_aug, clinical_aug = augment_pair(
+            row.Dermoscopic_Image,
+            row.Clinical_Image,
+            augmentation_seed
+        )
+
+        derm_path = Path(row.Dermoscopic_Image)
+        clinical_path = Path(row.Clinical_Image)
+
+        filename = (
+            derm_path.stem +
+            f"_aug_{copy_num + 1}.png"
+        )
+
+        derm_aug_path = (
+            derm_path.parent / filename
+        )
+
+        clinical_aug_path = (
+            clinical_path.parent / filename
+        )
+
+        derm_aug.save(derm_aug_path)
+        clinical_aug.save(clinical_aug_path)
+
+        augmented_records.append({
+            "Lesion_ID": row.Lesion_ID,
+            "Original_Row": row.Original_Row,
+            "Split": "train",
+            "Diagnosis": row.Diagnosis,
+            "Diagnosis_Code": row.Diagnosis_Code,
+            "Dermoscopic_Image": str(derm_aug_path),
+            "Clinical_Image": str(clinical_aug_path),
+            "Is_Augmented": True
+        })
+
+if augmented_records:
+    processed_all = pd.concat(
+        [
+            processed,
+            pd.DataFrame(augmented_records)
+        ],
+        ignore_index=True
+    )
+else:
+    processed_all = processed.copy()
+
+# ================================================================
+# STEP 15 - SAVE MANIFESTS
+# ================================================================
+
+manifest_names = {
+    "train": "09_Train_Image_Manifest.csv",
+    "validation": "09_Validation_Image_Manifest.csv",
+    "test": "09_Test_Image_Manifest.csv"
+}
+
+for split, filename in manifest_names.items():
+
+    subset = processed_all[
+        processed_all["Split"] == split
+    ].copy()
+
+    subset.to_csv(
+        MANIFEST_OUT / filename,
+        index=False
+    )
+
+processed.to_csv(
+    MANIFEST_OUT / "Original_Image_Pairs.csv",
+    index=False
+)
+
+processed_all.to_csv(
+    MANIFEST_OUT / "All_Processed_Images.csv",
+    index=False
+)
+
+# ================================================================
+# STEP 16 - FINAL VALIDATION
+# ================================================================
+
+assert len(processed) > 0
+assert processed["Dermoscopic_Image"].notna().all()
+assert processed["Clinical_Image"].notna().all()
+
+for path in tqdm(
+    processed_all["Dermoscopic_Image"],
+    desc="Checking saved dermoscopic images"
+):
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+
+for path in tqdm(
+    processed_all["Clinical_Image"],
+    desc="Checking saved clinical images"
+):
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+
+# Verify no lesion appears in multiple splits.
+for a, b in [
+    ("train", "validation"),
+    ("train", "test"),
+    ("validation", "test")
+]:
+
+    ids_a = set(
+        processed_all.loc[
+            processed_all["Split"] == a,
+            "Lesion_ID"
+        ]
+    )
+
+    ids_b = set(
+        processed_all.loc[
+            processed_all["Split"] == b,
+            "Lesion_ID"
+        ]
+    )
+
+    assert not (ids_a & ids_b), (
+        f"Lesion leakage between {a} and {b}"
+    )
+
+# Verify metadata can be joined to image pairs.
+metadata_keys = set(
+    zip(
+        encoded_df["Lesion_ID"].astype(str),
+        encoded_df["Original_Row"].astype(int)
+    )
+)
+
+image_keys = set(
+    zip(
+        processed["Lesion_ID"].astype(str),
+        processed["Original_Row"].astype(int)
+    )
+)
+
+missing_metadata = image_keys - metadata_keys
+
+if missing_metadata:
+    raise RuntimeError(
+        f"{len(missing_metadata)} image pairs "
+        "have no matching metadata row."
+    )
+
+print("\nAll output validation checks passed.")
+
+# ================================================================
+# STEP 17 - DATASET STATISTICS
+# ================================================================
+
+print("\n" + "=" * 75)
+print("FINAL DERM7PT PREPROCESSING SUMMARY")
+print("=" * 75)
+
+print("\nOriginal processed pairs:", len(processed))
+print("Augmented pairs:", len(augmented_records))
+print("Total saved pairs:", len(processed_all))
+
+print("\nSplit distribution:")
+print(
+    processed.groupby("Split").size()
+)
+
+print("\nClass distribution:")
+print(
+    pd.crosstab(
+        processed["Diagnosis"],
+        processed["Split"]
+    )
+)
+
+print("\nMetadata feature count:",
+      encoded_array.shape[1])
+
+# ================================================================
+# STEP 18 - VISUALIZATIONS
+# ================================================================
+
+# 18A: Class distribution
+class_counts = (
+    processed["Diagnosis"].value_counts()
+)
+
+plt.figure(figsize=(10, 5))
+plt.bar(
+    class_counts.index,
+    class_counts.values
+)
+plt.title("Derm7pt - Class Distribution")
+plt.ylabel("Number of Original Lesion Pairs")
+plt.xticks(rotation=25, ha="right")
+plt.grid(axis="y", alpha=0.2)
+plt.tight_layout()
+
+plt.savefig(
+    VIS_OUT / "Class_Distribution.png",
+    dpi=200
+)
+plt.show()
+
+# 18B: Split distribution
+split_counts = (
+    processed["Split"]
+    .value_counts()
+    .reindex(
+        ["train", "validation", "test"],
+        fill_value=0
+    )
+)
+
+plt.figure(figsize=(7, 4))
+plt.bar(
+    split_counts.index,
+    split_counts.values
+)
+plt.title("Derm7pt - Train / Validation / Test")
+plt.ylabel("Number of Original Lesion Pairs")
+plt.grid(axis="y", alpha=0.2)
+plt.tight_layout()
+
+plt.savefig(
+    VIS_OUT / "Dataset_Splits.png",
+    dpi=200
+)
+plt.show()
+
+# 18C: Paired image samples
+samples = processed.head(5)
+
+fig, axes = plt.subplots(
+    len(samples),
+    2,
+    figsize=(8, 3 * len(samples)),
+    squeeze=False
+)
+
+for i, row in enumerate(samples.itertuples(index=False)):
+
+    with Image.open(row.Dermoscopic_Image) as img:
+        axes[i, 0].imshow(img)
+
+    with Image.open(row.Clinical_Image) as img:
+        axes[i, 1].imshow(img)
+
+    axes[i, 0].set_title(
+        f"Dermoscopic - {row.Diagnosis}"
+    )
+
+    axes[i, 1].set_title(
+        f"Clinical - {row.Diagnosis}"
+    )
+
+    axes[i, 0].axis("off")
+    axes[i, 1].axis("off")
+
+plt.tight_layout()
+plt.savefig(
+    VIS_OUT / "Paired_Image_Samples.png",
+    dpi=200
+)
+plt.show()
+
+# ================================================================
+# STEP 19 - SAVE FINAL REPORT
+# ================================================================
+
+summary = {
+    "Dataset": "Derm7pt",
+    "Input_Path": str(ROOT),
+    "Output_Path": str(OUTPUT),
+    "Image_Size": list(IMG_SIZE),
+    "Original_Processed_Pairs": int(len(processed)),
+    "Augmented_Training_Pairs": int(
+        len(augmented_records)
+    ),
+    "Total_Saved_Pairs": int(
+        len(processed_all)
+    ),
+    "Train_Original": int(
+        (processed["Split"] == "train").sum()
+    ),
+    "Validation_Original": int(
+        (processed["Split"] == "validation").sum()
+    ),
+    "Test_Original": int(
+        (processed["Split"] == "test").sum()
+    ),
+    "Metadata_Feature_Count": int(
+        encoded_array.shape[1]
+    ),
+    "Class_Names": CLASS_NAMES,
+    "Leakage_Check": "Passed"
+}
+
+with open(
+    REPORT_OUT / "Preprocessing_Summary.json",
+    "w"
+) as f:
+    json.dump(summary, f, indent=4)
+
+print("\n" + "=" * 75)
+print("DERM7PT PREPROCESSING COMPLETED SUCCESSFULLY")
+print("=" * 75)
+
+print("Original image pairs:", len(processed))
+print("Augmented pairs:", len(augmented_records))
+print("Total saved pairs:", len(processed_all))
+print("Encoded metadata features:",
+      encoded_array.shape[1])
+
+print("\nSAVED FOLDERS:")
+print("Dermoscopic:", DERM_OUT)
+print("Clinical:", CLINICAL_OUT)
+print("Manifests:", MANIFEST_OUT)
+print("Metadata:", META_OUT)
+print("Visualizations:", VIS_OUT)
+print("Reports:", REPORT_OUT)
+
+print("\nNEXT PROCESS:")
+print("STEP 3 - LCTS-Net Lesion Segmentation")
+
+
+
